@@ -1,5 +1,5 @@
 /*
- * Simple Archiver v1.0.0
+ * Simple Archiver v1.0.1
  * Copyright (c) 2022 Carlos de Diego
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -14,7 +14,6 @@
 #include <string>
 #include <vector>
 #include <stdio.h> //size_t
-#include <iostream>
 
 namespace archiver {
 
@@ -41,31 +40,31 @@ namespace archiver {
 	};
 
 	struct CompressionMethodData {
-		string name;
+		std::string name;
 		int minLevel;
 		int maxLevel;
 	};
 
 	//Creates and extracts archives. Both will return 0 on success or user abort or an error code on failure
-	int create_archive(vector<string> inputFiles, string archivePath, string compressionName, 
-		int compressionLevel, string encryptionName, string password, size_t blockSize, 
+	int create_archive(std::vector<std::string> inputFiles, std::string archivePath, std::string compressionName, 
+		int compressionLevel, std::string encryptionName, std::string password, size_t blockSize, 
 		bool useSolidBlock, int threads, ArchiveCallback* callbacks = nullptr);
-	int extract_archive(string file, string outDir, string password, int threads, ArchiveCallback* callbacks = nullptr);
+	int extract_archive(std::string file, std::string outDir, std::string password, int threads, ArchiveCallback* callbacks = nullptr);
 
 	//Returs some data about the available compression algorithms
-	vector<CompressionMethodData> get_compression_methods();
+	std::vector<CompressionMethodData> get_compression_methods();
 	//Returs an estimation of the amount of memory the encoder will use 
-	size_t estimate_memory(string compressionName, int compressionLevel, size_t blockSize, int threads);
+	size_t estimate_memory(std::string compressionName, int compressionLevel, size_t blockSize, int threads);
 	//Returns whether a given archive is encrypted or an error code on failure
-	int is_archive_encrypted(string file);
+	int is_archive_encrypted(std::string file);
 }
 
 #ifdef ARCHIVER_IMPLEMENTATION
 
 #include <thread>
 #include <mutex>
-#include <atomic>
 #include <cstdint>
+#include <time.h>
 
 #define SKANDA_IMPLEMENTATION
 #include "Skanda.h"
@@ -103,7 +102,7 @@ namespace archiver {
 			*out++ = byte;
 		} while (value);
 	}
-	void write_LEB128_file(fstream* out, size_t value) {
+	void write_LEB128_file(std::fstream* out, size_t value) {
 		do {
 			uint8_t byte = value & 0x7F;
 			value >>= 7;
@@ -111,7 +110,7 @@ namespace archiver {
 			out->put(byte);
 		} while (value);
 	}
-	void write_LEB128_vector(vector<uint8_t>* out, size_t value) {
+	void write_LEB128_vector(std::vector<uint8_t>* out, size_t value) {
 		do {
 			uint8_t byte = value & 0x7F;
 			value >>= 7;
@@ -133,7 +132,7 @@ namespace archiver {
 		} while (byte & 0x80);
 		return 0;
 	}
-	int read_LEB128_file(fstream* in, size_t* value) {
+	int read_LEB128_file(std::fstream* in, size_t* value) {
 		*value = 0;
 		uint8_t byte;
 		size_t iterations = 0;
@@ -152,7 +151,7 @@ namespace archiver {
 		ArchiveCallback* userCallbacks = nullptr;
 		std::mutex threadMtx;
 		size_t totalSize = 0;
-		vector<size_t> threadProgress;
+		std::vector<size_t> threadProgress;
 		int internalError = 0;  //For errors like out of memory or bad crc
 		bool doAbort = false;  //When we get confirmation for abort from user do not ask again
 
@@ -161,7 +160,7 @@ namespace archiver {
 			userCallbacks = c;
 		}
 		void set_parameters(size_t threads, size_t size) {
-			threadProgress = vector<size_t>(threads, 0);
+			threadProgress = std::vector<size_t>(threads, 0);
 			totalSize = size;
 		}
 		int get_internal_error() {
@@ -209,16 +208,12 @@ namespace archiver {
 			threadID = id;
 			archiveCallbacks = c;
 		}
-		void start_block(size_t _blockRawSize) {
-			blockRawSize = _blockRawSize;
+		void end_block(size_t blockRawSize) {
+			totalProgress += blockRawSize;
 			blockProgress = 0;
 		}
 		void progress(size_t bytes) {
 			blockProgress = bytes;
-			if (blockProgress == blockRawSize) {
-				totalProgress += blockRawSize;
-				blockProgress = 0;
-			}
 			archiveCallbacks->add_progress(totalProgress + blockProgress, threadID);
 		}
 		void set_error(int error) {
@@ -248,7 +243,6 @@ namespace archiver {
 
 	size_t skanda_compress(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress) 
 	{
-		progress->start_block(size);
 		SkandaProgressCallback progressCallback(progress);
 		try {
 			output = new uint8_t[skanda::skanda_compress_bound(size)];
@@ -267,19 +261,18 @@ namespace archiver {
 		return compressedSize;
 	}
 	void skanda_decompress(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed,
-		size_t decompressedSize, ThreadCallback* progress) 
+		size_t uncompressedSize, ThreadCallback* progress)
 	{
-		progress->start_block(decompressedSize);
 		SkandaProgressCallback progressCallback(progress);
 		try {
-			decompressed = new uint8_t[decompressedSize];
+			decompressed = new uint8_t[uncompressedSize];
 		}
 		catch (std::bad_alloc& e) {
 			delete[] compressed;
 			progress->set_error(ERROR_OUT_OF_MEMORY);
 			return;
 		}
-		int error = skanda::skanda_decompress(compressed, compressedSize, decompressed, decompressedSize, &progressCallback);
+		int error = skanda::skanda_decompress(compressed, compressedSize, decompressed, uncompressedSize, &progressCallback);
 		delete[] compressed;
 		if (error)
 			progress->set_error(ERROR_BAD_FILE);
@@ -307,7 +300,6 @@ namespace archiver {
 
 	size_t strider_compress(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress)
 	{
-		progress->start_block(size);
 		StriderProgressCallback progressCallback(progress);
 		try {
 			output = new uint8_t[strider::strider_compress_bound(size)];
@@ -326,19 +318,18 @@ namespace archiver {
 		return compressedSize;
 	}
 	void strider_decompress(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed,
-		size_t decompressedSize, ThreadCallback* progress)
+		size_t uncompressedSize, ThreadCallback* progress)
 	{
-		progress->start_block(decompressedSize);
 		StriderProgressCallback progressCallback(progress);
 		try {
-			decompressed = new uint8_t[decompressedSize];
+			decompressed = new uint8_t[uncompressedSize];
 		}
 		catch (std::bad_alloc& e) {
 			delete[] compressed;
 			progress->set_error(ERROR_OUT_OF_MEMORY);
 			return;
 		}
-		int error = strider::strider_decompress(compressed, compressedSize, decompressed, decompressedSize, &progressCallback);
+		int error = strider::strider_decompress(compressed, compressedSize, decompressed, uncompressedSize, &progressCallback);
 		delete[] compressed;
 		if (error)
 			progress->set_error(ERROR_BAD_FILE);
@@ -360,10 +351,8 @@ namespace archiver {
 			originalSize = origSize;
 		}
 		void progress(size_t bytes) {
-			if (bytes == preprocessedSize)
-				backendCallback->progress(originalSize);
-			else
-				backendCallback->progress((float)bytes / preprocessedSize * originalSize);
+			size_t relative = std::min(originalSize, (size_t)((float)bytes / preprocessedSize * originalSize));
+			backendCallback->progress(relative);
 		}
 		int abort() {
 			if (backendCallback)
@@ -372,9 +361,21 @@ namespace archiver {
 		}
 	};
 
+	size_t spectrum_strider_backend(const uint8_t* data, const size_t size) {
+		uint8_t* out;
+		try {
+			out = new uint8_t[strider::strider_compress_bound(size)];
+		}
+		catch (std::bad_alloc& e) {
+			return 0;
+		}
+		size_t compressed = strider::strider_compress(data, size, out, 0);
+		delete[] out;
+		return compressed;
+	}
+
 	size_t spectrum_strider_compress(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress)
 	{
-		progress->start_block(size);
 		uint8_t* preprocessed;
 		try {
 			preprocessed = new uint8_t[spectrum::spectrum_bound(size)];
@@ -384,7 +385,7 @@ namespace archiver {
 			progress->set_error(ERROR_OUT_OF_MEMORY);
 			return 0;
 		}
-		size_t preprocessedSize = spectrum::spectrum_encode(input, size, preprocessed);
+		size_t preprocessedSize = spectrum::spectrum_encode(input, size, preprocessed, level < 4 ? nullptr : &spectrum_strider_backend);
 		delete[] input;
 		if (preprocessedSize == -1) {
 			progress->set_error(ERROR_OUT_OF_MEMORY);
@@ -412,15 +413,14 @@ namespace archiver {
 		return compressedSize + (compressedBegin - output);
 	}
 	void spectrum_strider_decompress(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed,
-		size_t decompressedSize, ThreadCallback* progress)
+		size_t uncompressedSize, ThreadCallback* progress)
 	{
 		//First we read preprocessed size
 		size_t preprocessedSize;
 		const uint8_t* compressedBegin = compressed;
 		read_LEB128_ptr(compressedBegin, compressed + compressedSize, &preprocessedSize);
 
-		progress->start_block(decompressedSize);
-		SpectrumStriderProgressCallback progressCallback(progress, preprocessedSize, decompressedSize);
+		SpectrumStriderProgressCallback progressCallback(progress, preprocessedSize, uncompressedSize);
 		uint8_t* preprocessed;
 		try {
 			preprocessed = new uint8_t[preprocessedSize];
@@ -437,14 +437,14 @@ namespace archiver {
 			return;
 		}
 		try {
-			decompressed = new uint8_t[decompressedSize];
+			decompressed = new uint8_t[uncompressedSize];
 		}
 		catch (std::bad_alloc& e) {
 			delete[] preprocessed;
 			progress->set_error(ERROR_OUT_OF_MEMORY);
 			return;
 		}
-		error = spectrum::spectrum_decode(preprocessed, preprocessedSize, decompressed, decompressedSize);
+		error = spectrum::spectrum_decode(preprocessed, preprocessedSize, decompressed, uncompressedSize);
 		delete[] preprocessed;
 		if (error)
 			progress->set_error(ERROR_BAD_FILE);
@@ -455,20 +455,18 @@ namespace archiver {
 
 	size_t none_compress(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress) 
 	{
-		progress->start_block(size);
 		output = input;
 		if (progress)
 			progress->progress(size);
 		return size;
 	}
-	int none_decompress(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed, 
-		size_t decompressedSize, ThreadCallback* progress = nullptr) 
+	void none_decompress(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed, 
+		size_t uncompressedSize, ThreadCallback* progress = nullptr)
 	{
-		progress->start_block(decompressedSize);
 		decompressed = compressed;
 		if (progress)
-			progress->progress(decompressedSize);
-		return 0;
+			progress->progress(uncompressedSize);
+		return;
 	}
 	size_t none_estimate_memory(size_t size, int level) {
 		return size;
@@ -478,41 +476,48 @@ namespace archiver {
 		CompressionMethodData data;
 		//Both compress and decompress take a pointer to a memory location with the input data, and must allocate
 		// the pointer to the output data. In all cases the input data must be freed.
-		std::function<size_t(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress)> compress;
-		std::function<void(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed, size_t uncompressedSize, ThreadCallback* progress)> decompress;
-		std::function<size_t(size_t size, int level)> estimate_memory;
+		size_t(*compress)(uint8_t*& input, size_t size, uint8_t*& output, int level, ThreadCallback* progress);
+		void(*decompress)(uint8_t*& compressed, size_t compressedSize, uint8_t*& decompressed, size_t uncompressedSize, ThreadCallback* progress);
+		size_t(*estimate_memory)(size_t size, int level);
 
 		//To find the algorithm
-		bool operator==(const string& other) const {
+		bool operator==(const std::string& other) const {
 			return data.name == other;
 		}
 	};
 
 	const vector<CompressionMethod> compressionMethods = {
-		{ { string("none"), 0, 0 }, &none_compress, &none_decompress, &none_estimate_memory },
-		{ { string("skanda"), 0, 10 }, &skanda_compress, &skanda_decompress, &skanda_estimate_memory },
-		{ { string("strider"), 0, 10 }, &strider_compress, &strider_decompress, &strider_estimate_memory },
-		{ { string("spectrum/strider"), 0, 10 }, &spectrum_strider_compress, &spectrum_strider_decompress, &spectrum_strider_estimate_memory },
+		{ { std::string("none"), 0, 0 }, &none_compress, &none_decompress, &none_estimate_memory },
+		{ { std::string("skanda"), 0, 10 }, &skanda_compress, &skanda_decompress, &skanda_estimate_memory },
+		{ { std::string("strider"), 0, 10 }, &strider_compress, &strider_decompress, &strider_estimate_memory },
+		{ { std::string("spectrum/strider"), 0, 10 }, &spectrum_strider_compress, &spectrum_strider_decompress, &spectrum_strider_estimate_memory },
 	};
 
-	vector<uint8_t> hash_none(string password, uint32_t salt) {
-		return vector<uint8_t>();
+	std::vector<uint8_t> hash_none(std::string password, std::vector<uint8_t> salt) {
+		return std::vector<uint8_t>();
 	}
-	void encrypt_none(uint8_t* data, size_t size, vector<uint8_t> hash) {
+	void encrypt_none(uint8_t* data, size_t size, std::vector<uint8_t> hash) {
 		return;
 	}
 
-	vector<uint8_t> hash_sha256(string password, uint32_t salt) {
-		password.push_back((salt >> 0) & 0xFF);
-		password.push_back((salt >> 8) & 0xFF);
-		password.push_back((salt >> 16) & 0xFF);
-		password.push_back((salt >> 24) & 0xFF);
-		vector<uint8_t> hash(picosha2::k_digest_size);
-		picosha2::hash256<string>(password, hash);
-		return hash;
+	std::vector<uint8_t> hash_sha256(std::string password, std::vector<uint8_t> salt) {
+		//Add salt to the password
+		for (uint8_t byte : salt)
+			password.push_back(byte);
+		//Perform first hash on the password
+		std::vector<uint8_t> hashA(picosha2::k_digest_size);
+		picosha2::hash256<std::string>(password, hashA);
+
+		//Key stretching
+		std::vector<uint8_t> hashB(picosha2::k_digest_size);
+		for (size_t i = 0; i < 65536; i++) {
+			picosha2::hash256<std::vector<uint8_t>>(hashA, hashB);
+			hashA = hashB;
+		}
+		return hashA;
 	}
 	//Both encryptor and decryptor perform the same operations
-	void encrypt_sha256(uint8_t* data, size_t size, vector<uint8_t> hash) {
+	void encrypt_sha256(uint8_t* data, size_t size, std::vector<uint8_t> hash) {
 
 		for (size_t i = 0; i < size; i++) {
 			uint32_t baseHashIndex = i % 32;
@@ -524,32 +529,44 @@ namespace archiver {
 	}
 
 	struct EncryptionMethod {
-		string name;
-		std::function<vector<uint8_t>(string password, uint32_t salt)> hash;
-		std::function<void(uint8_t* data, size_t size, vector<uint8_t> hash)> encrypt;
-		std::function<void(uint8_t* data, size_t size, vector<uint8_t> hash)> decrypt;
+		std::string name;
+		size_t saltLength;
+		std::vector<uint8_t>(*hash)(std::string password, std::vector<uint8_t> salt);
+		void(*encrypt)(uint8_t* data, size_t size, std::vector<uint8_t> hash);
+		void(*decrypt)(uint8_t* data, size_t size, std::vector<uint8_t> hash);
 
-		bool operator==(const string& other) const {
+		bool operator==(const std::string& other) const {
 			return name == other;
 		}
 	};
 
-	const vector<EncryptionMethod> encryptionMethods = {
-		{ "none", &hash_none, &encrypt_none, &encrypt_none },
-		{ "sha256", &hash_sha256, &encrypt_sha256, &encrypt_sha256 }
+	std::vector<uint8_t> generate_salt(size_t saltLength) {
+		std::vector<uint8_t> result(saltLength, 0);
+		uint32_t seedA = rand32(std::time(nullptr));
+		uint32_t seedB = reinterpret_cast<uint32_t>(result.data());
+
+		for (size_t i = 0; i < 4; i++) {
+			result[(i + 0) % saltLength] ^= seedA >> i * 8;
+			result[(i + 4) % saltLength] ^= seedB >> i * 8;
+		}
+	}
+
+	const std::vector<EncryptionMethod> encryptionMethods = {
+		{ "none", 0, &hash_none, &encrypt_none, &encrypt_none },
+		{ "sha256", 4, &hash_sha256, &encrypt_sha256, &encrypt_sha256 }
 	};
 
 	struct FileInfo {
-		string absolutePath;
-		string relativePath;
-		string filename;
+		std::string absolutePath;
+		std::string relativePath;
+		std::string filename;
 		size_t size;
 
 		//For file sort. Placing similar files together can improve compression
 		bool operator<(FileInfo& other) {
 			
-			string extensionA = filesystem::path(absolutePath).extension().string();
-			string extensionB = filesystem::path(other.absolutePath).extension().string();
+			std::string extensionA = std::filesystem::path(absolutePath).extension().string();
+			std::string extensionB = std::filesystem::path(other.absolutePath).extension().string();
 
 			if (extensionA != extensionB)
 				return extensionA < extensionB;
@@ -565,45 +582,46 @@ namespace archiver {
 	};
 
 	void compress_block(uint8_t* input, CompressedBlock* compressedBlock, CompressionMethod compressionMethod, 
-		int compressionLevel, EncryptionMethod encryptionMethod, vector<uint8_t> hash, ThreadCallback* callbacks)
+		int compressionLevel, EncryptionMethod encryptionMethod, std::vector<uint8_t> hash, ThreadCallback* callbacks)
 	{
 		compressedBlock->compressedSize = compressionMethod.compress(input, compressedBlock->originalSize, compressedBlock->data, compressionLevel, callbacks);
 		if (callbacks->abort()) 
 			return;
+		callbacks->end_block(compressedBlock->originalSize);
 		compressedBlock->checksum = CRC::Calculate(compressedBlock->data, compressedBlock->compressedSize, CRC::CRC_32());
 		encryptionMethod.encrypt(compressedBlock->data, compressedBlock->compressedSize, hash);
 	}
 
-	int read_directory_and_create_header(vector<string> inputFiles, fstream* outFile, 
-		EncryptionMethod encryptionMethod, vector<uint8_t> hash, vector<FileInfo>* filesToCompress, bool useSolidBlock) {
+	int read_directory_and_create_header(std::vector<std::string> inputFiles, std::fstream* outFile, 
+		EncryptionMethod encryptionMethod, std::vector<uint8_t> hash, std::vector<FileInfo>* filesToCompress, bool useSolidBlock) {
 
 		//Search for all archives
-		vector<string> directories;
+		std::vector<std::string> directories;
 		std::vector<uint8_t> headerStream;
 		try {
 			for (size_t i = 0; i < inputFiles.size(); i++) {
-				if (filesystem::is_directory(inputFiles[i])) {
+				if (std::filesystem::is_directory(inputFiles[i])) {
 					size_t relPathStart = inputFiles[i].rfind('\\') + 1;
 					directories.push_back(inputFiles[i].substr(relPathStart));
 
-					for (auto entry : filesystem::recursive_directory_iterator(inputFiles[i])) {
+					for (auto entry : std::filesystem::recursive_directory_iterator(inputFiles[i])) {
 						if (entry.is_directory()) {
 							directories.push_back(entry.path().string().substr(relPathStart));
 						}
 						else {
-							string absPath = entry.path().string();
-							string relPath = absPath.substr(relPathStart);
-							string filename = entry.path().filename().string();
-							size_t size = filesystem::file_size(absPath);
+							std::string absPath = entry.path().string();
+							std::string relPath = absPath.substr(relPathStart);
+							std::string filename = entry.path().filename().string();
+							size_t size = std::filesystem::file_size(absPath);
 							filesToCompress->push_back({ absPath, relPath, filename, size });
 						}
 					}
 				}
 				else {
-					string absPath = inputFiles[i];
-					string relPath = filesystem::path(absPath).filename().string();
-					string filename = relPath;
-					size_t size = filesystem::file_size(absPath);
+					std::string absPath = inputFiles[i];
+					std::string relPath = std::filesystem::path(absPath).filename().string();
+					std::string filename = relPath;
+					size_t size = std::filesystem::file_size(absPath);
 					filesToCompress->push_back({ absPath, relPath, filename, size });
 				}
 			}
@@ -644,13 +662,13 @@ namespace archiver {
 		return 0;
 	}
 
-	int create_archive(vector<string> inputFiles, string archivePath, string compressionName, int compressionLevel,
-		string encryptionName, string password, size_t blockSize, bool useSolidBlock, int threads, ArchiveCallback* callbacks) {
+	int create_archive(std::vector<std::string> inputFiles, std::string archivePath, std::string compressionName, int compressionLevel,
+		std::string encryptionName, std::string password, size_t blockSize, bool useSolidBlock, int threads, ArchiveCallback* callbacks) {
 
 		ArchiveCallbackInternal callbacksInternal(callbacks);
 
 		//Create the archive
-		fstream outFile(archivePath, fstream::binary | fstream::out);
+		std::fstream outFile(archivePath, std::fstream::binary | std::fstream::out);
 		outFile.write((char*)&FILE_MAGIC_NUMBER, 8);
 
 		//Write compression method used
@@ -662,17 +680,17 @@ namespace archiver {
 		auto encryptionMethod = std::find(encryptionMethods.begin(), encryptionMethods.end(), encryptionName);
 		outFile.put(encryptionMethod->name.size());
 		outFile.write(encryptionMethod->name.data(), encryptionMethod->name.size());
-		uint32_t salt = rand32(std::time(nullptr));
-		outFile.write((char*)&salt, 4);
-		vector<uint8_t> hash = encryptionMethod->hash(password, salt);
+		std::vector<uint8_t> salt = generate_salt(encryptionMethod->saltLength);
+		outFile.write((char*)salt.data(), salt.size());
+		std::vector<uint8_t> hash = encryptionMethod->hash(password, salt);
 
 		//Directories
-		vector<FileInfo> filesToCompress;
+		std::vector<FileInfo> filesToCompress;
 		int error = read_directory_and_create_header(inputFiles, &outFile, 
 			*encryptionMethod, hash, &filesToCompress, useSolidBlock);
 		if (error) {
 			outFile.close();
-			filesystem::remove(archivePath);
+			std::filesystem::remove(archivePath);
 			return error;
 		}
 
@@ -682,10 +700,10 @@ namespace archiver {
 		callbacksInternal.set_parameters(threads, totalContainedSize);
 
 		//Compression
-		fstream inFile;
+		std::fstream inFile;
 		size_t readFiles = 0;
 		
-		thread* cpu = new thread[threads];
+		std::thread* cpu = new std::thread[threads];
 		ThreadCallback* progress = new ThreadCallback[threads]; 
 		CompressedBlock* outBlocks = new CompressedBlock[threads];
 
@@ -715,7 +733,7 @@ namespace archiver {
 						break;
 
 					if (!inFile.is_open())
-						inFile.open(filesToCompress[readFiles].absolutePath, fstream::in | fstream::binary);
+						inFile.open(filesToCompress[readFiles].absolutePath, std::fstream::in | std::fstream::binary);
 					size_t bytesToRead = std::min(blockSize - thisBlockSize, filesToCompress[readFiles].size);
 					inFile.read((char*)inputBuffer + thisBlockSize, bytesToRead);
 
@@ -737,7 +755,7 @@ namespace archiver {
 				size_t thisThreadID = startedThreads % threads;
 				progress[thisThreadID].init(thisThreadID, &callbacksInternal);
 				outBlocks[thisThreadID] = { nullptr, thisBlockSize, 0, 0 };
-				cpu[thisThreadID] = thread(compress_block, inputBuffer, &outBlocks[thisThreadID], *compressionMethod,
+				cpu[thisThreadID] = std::thread(compress_block, inputBuffer, &outBlocks[thisThreadID], *compressionMethod,
 					compressionLevel, *encryptionMethod, hash, &progress[thisThreadID]);
 			}
 
@@ -766,7 +784,7 @@ namespace archiver {
 
 		outFile.close();
 		if (callbacksInternal.abort())
-			filesystem::remove(archivePath);
+			std::filesystem::remove(archivePath);
 		return callbacksInternal.get_internal_error();
 	}
 
@@ -777,7 +795,7 @@ namespace archiver {
 
 	void decompress_block(uint8_t* input, uint8_t** output, size_t compressedSize, size_t originalSize, 
 		CompressionMethod compressionMethod, EncryptionMethod encryptionMethod, uint32_t crc, 
-		vector<uint8_t> hash, ThreadCallback* callbacks) 
+		std::vector<uint8_t> hash, ThreadCallback* callbacks) 
 	{
 		encryptionMethod.decrypt(input, compressedSize, hash);
 		uint32_t computedChecksum = CRC::Calculate(input, compressedSize, CRC::CRC_32());
@@ -787,10 +805,11 @@ namespace archiver {
 			return;
 		}
 		compressionMethod.decompress(input, compressedSize, *output, originalSize, callbacks);
+		callbacks->end_block(originalSize);
 	}
 
-	int read_directory_header(fstream* inFile, EncryptionMethod encryptionMethod,
-		vector<uint8_t> hash, vector<string>* directories, vector<FileInfo>* fileList, string path) {
+	int read_directory_header(std::fstream* inFile, EncryptionMethod encryptionMethod,
+		std::vector<uint8_t> hash, std::vector<std::string>* directories, std::vector<FileInfo>* fileList, std::string path) {
 
 		size_t headerSize = 0;
 		if (read_LEB128_file(inFile, &headerSize))
@@ -827,7 +846,7 @@ namespace archiver {
 					delete[] headerStream;
 					return ERROR_BAD_FILE;
 				}
-				string relPath;
+				std::string relPath;
 				relPath.push_back(*headerStreamIt++);
 				//File names must be at least one byte long
 				if (relPath[0] == '\0') {
@@ -866,8 +885,8 @@ namespace archiver {
 						return ERROR_BAD_FILE;
 					}
 
-					string absPath = path + '\\' + relPath;
-					string filename = filesystem::path(absPath).filename().string();
+					std::string absPath = path + '\\' + relPath;
+					std::string filename = std::filesystem::path(absPath).filename().string();
 					fileList->push_back({ absPath, relPath, filename, fileSize });
 				}
 			}
@@ -881,12 +900,12 @@ namespace archiver {
 		return 0;
 	}
 
-	int extract_archive(string file, string outDir, string password, int threads, ArchiveCallback* callbacks) {
+	int extract_archive(std::string file, std::string outDir, std::string password, int threads, ArchiveCallback* callbacks) {
 
 		ArchiveCallbackInternal callbacksInternal(callbacks);
 
 		//Magic number
-		fstream inFile(file, fstream::binary | fstream::in);
+		std::fstream inFile(file, std::fstream::binary | std::fstream::in);
 		if (!inFile.is_open())
 			return ERROR_FILE_OPEN_FAILED;
 		uint8_t storedMagicNumber[8];
@@ -900,7 +919,7 @@ namespace archiver {
 		}
 
 		//Compression method
-		string compressionName;
+		std::string compressionName;
 		compressionName.resize(inFile.get());
 		inFile.read(compressionName.data(), compressionName.size());
 		auto compressionMethod = std::find(compressionMethods.begin(), compressionMethods.end(), compressionName);
@@ -908,30 +927,30 @@ namespace archiver {
 			return ERROR_UNKNOWN_COMPRESSION;
 
 		//Encryption method
-		string encryptionName;
+		std::string encryptionName;
 		encryptionName.resize(inFile.get());
 		inFile.read(encryptionName.data(), encryptionName.size());
 		auto encryptionMethod = std::find(encryptionMethods.begin(), encryptionMethods.end(), encryptionName);
 		if (encryptionMethod == encryptionMethods.end())
 			return ERROR_UNKNOWN_ENCRYPTION;
-		uint32_t salt;
-		inFile.read((char*)&salt, 4);
+		std::vector<uint8_t> salt(encryptionMethod->saltLength);
+		inFile.read((char*)salt.data(), salt.size());
 		
-		vector<uint8_t> hash;
+		std::vector<uint8_t> hash;
 		hash = encryptionMethod->hash(password, salt);
 
 		//Header
-		vector<string> directories;
-		vector<FileInfo> fileList;
+		std::vector<std::string> directories;
+		std::vector<FileInfo> fileList;
 		int error = read_directory_header(&inFile, *encryptionMethod, 
 			hash, &directories, &fileList, outDir);
 		if (error)
 			return error;
 
 		for (auto it = directories.begin(); it != directories.end(); it++) 
-			filesystem::create_directories(*it);
+			std::filesystem::create_directories(*it);
 		for (auto it = fileList.begin(); it != fileList.end(); it++) {
-			fstream o(it->absolutePath, fstream::out | fstream::binary);
+			std::fstream o(it->absolutePath, std::fstream::out | std::fstream::binary);
 			o.close();
 		}
 
@@ -941,11 +960,11 @@ namespace archiver {
 		callbacksInternal.set_parameters(threads, totalContainedSize);
 
 		//Compressed data
-		fstream outFile;
+		std::fstream outFile;
 		size_t writtenFiles = 0;
 		size_t remainingData = totalContainedSize;
 
-		thread* cpu = new thread[threads];
+		std::thread* cpu = new std::thread[threads];
 		ThreadCallback* progress = new ThreadCallback[threads];
 		DecompressedBlock* outBlocks = new DecompressedBlock[threads];
 
@@ -987,7 +1006,7 @@ namespace archiver {
 				size_t thisThreadID = startedThreads % threads;
 				progress[thisThreadID].init(thisThreadID, &callbacksInternal);
 				outBlocks[thisThreadID] = { nullptr, originalSize };
-				cpu[thisThreadID] = thread(decompress_block, compressedData, &outBlocks[thisThreadID].data, compressedSize, originalSize,
+				cpu[thisThreadID] = std::thread(decompress_block, compressedData, &outBlocks[thisThreadID].data, compressedSize, originalSize,
 					*compressionMethod, *encryptionMethod, storedChecksum, hash, &progress[thisThreadID]);
 			}
 
@@ -1000,7 +1019,7 @@ namespace archiver {
 			size_t bytesWritten = 0;
 			do {
 				if (!outFile.is_open())
-					outFile.open(fileList[writtenFiles].absolutePath, fstream::binary | fstream::out);
+					outFile.open(fileList[writtenFiles].absolutePath, std::fstream::binary | std::fstream::out);
 
 				size_t bytesToWrite = std::min(fileList[writtenFiles].size, outBlocks[thisThreadID].bytesToWrite);
 				outFile.write((char*)outBlocks[thisThreadID].data + bytesWritten, bytesToWrite);
@@ -1031,28 +1050,28 @@ namespace archiver {
 		outFile.close();
 		if (callbacksInternal.abort()) {
 			for (auto it = fileList.begin(); it != fileList.end(); it++)
-				filesystem::remove(it->absolutePath);
+				std::filesystem::remove(it->absolutePath);
 			for (auto it = directories.begin(); it != directories.end(); it++)
-				filesystem::remove(*it);
+				std::filesystem::remove(*it);
 		}
 		return callbacksInternal.get_internal_error();
 	}
 
-	vector<CompressionMethodData> get_compression_methods() {
-		vector<CompressionMethodData> list;
+	std::vector<CompressionMethodData> get_compression_methods() {
+		std::vector<CompressionMethodData> list;
 		for (auto method : compressionMethods)
 			list.push_back(method.data);
 		return list;
 	}
-	size_t estimate_memory(string compressionName, int compressionLevel, size_t blockSize, int threads) {
+	size_t estimate_memory(std::string compressionName, int compressionLevel, size_t blockSize, int threads) {
 		auto compressionMethod = std::find(compressionMethods.begin(), compressionMethods.end(), compressionName);
 		if (compressionMethod == compressionMethods.end())
 			return 0;
 		return (compressionMethod->estimate_memory(blockSize, compressionLevel) + blockSize) * threads;
 	}
-	int is_archive_encrypted(string file) {
+	int is_archive_encrypted(std::string file) {
 
-		fstream inFile(file, fstream::binary | fstream::in);
+		std::fstream inFile(file, std::fstream::binary | std::fstream::in);
 		if (!inFile.is_open())
 			return ERROR_FILE_OPEN_FAILED;
 		uint8_t storedMagicNumber[8];
@@ -1066,9 +1085,9 @@ namespace archiver {
 		}
 
 		size_t compressionNameSize = inFile.get();
-		inFile.seekg(compressionNameSize, fstream::cur);
+		inFile.seekg(compressionNameSize, std::fstream::cur);
 
-		string encryptionName;
+		std::string encryptionName;
 		encryptionName.resize(inFile.get());
 		inFile.read(encryptionName.data(), encryptionName.size());
 		return encryptionName != "none";
