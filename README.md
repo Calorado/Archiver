@@ -40,7 +40,11 @@ GARRY'S MOD  (4.456.090.746 bytes)
 # Libraries used
 
 The following libraries are used inside this project. 
-Picosha256: https://github.com/okdshin/PicoSHA2/tree/master
-XXHash: https://github.com/Cyan4973/xxHash
+
+Picosha256: https://github.com/okdshin/PicoSHA2/tree/master 
+
+XXHash: https://github.com/Cyan4973/xxHash 
+
 CRCpp: https://github.com/d-bahr/CRCpp
+
 TinyAES: https://github.com/kokke/tiny-AES-c
