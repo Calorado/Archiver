@@ -36,11 +36,11 @@ archiver::Parameters DEFAULT_PARAMETERS[10] = {
 	{ { }, 0, "", 0, false, 1 * MiB, 1 },
 	{ { "spectrum", "strider" }, 0, "", 16, true, 8 * MiB, 1 },
 	{ { "spectrum", "strider" }, 2, "", 16, true, 8 * MiB, 1 },
-	{ { "spectrum", "strider" }, 3, "", 16, true, 16 * MiB, 1 },
-	{ { "spectrum", "strider" }, 4, "", 16, true, 16 * MiB, 1 },
-	{ { "spectrum", "strider" }, 5, "", 17, true, 32 * MiB, 1 },
-	{ { "spectrum", "strider" }, 6, "", 17, true, 32 * MiB, 1 },
-	{ { "spectrum", "strider" }, 7, "", 18, true, 64 * MiB, 1 },
+	{ { "spectrum", "strider" }, 3, "", 17, true, 16 * MiB, 1 },
+	{ { "spectrum", "strider" }, 4, "", 17, true, 16 * MiB, 1 },
+	{ { "spectrum", "strider" }, 5, "", 18, true, 32 * MiB, 1 },
+	{ { "spectrum", "strider" }, 6, "", 18, true, 32 * MiB, 1 },
+	{ { "spectrum", "strider" }, 7, "", 19, true, 64 * MiB, 1 },
 	{ { "spectrum", "strider" }, 8, "", 19, true, 64 * MiB, 1 },
 	{ { "spectrum", "strider" }, 9, "", 20, true, 128 * MiB, 1 },
 };
@@ -72,14 +72,14 @@ public:
 		speed = speed * 63 / 64 + newSpeed * 1 / 64;
 		size_t prefixIndex = std::min(std::log2(speed) / 10, 6.0f);
 
-		if (prevPrintTime == initTime || (std::chrono::high_resolution_clock::now() - prevPrintTime).count() > 100'000'000) {
+		if (prevPrintTime == initTime || (std::chrono::high_resolution_clock::now() - prevPrintTime).count() > 100'000'000 || consumed == total) {
 			prevPrintTime = std::chrono::high_resolution_clock::now();
 			for (int i = 0; i < 100; i++)
 				std::cout << "\b";
 			std::cout << std::fixed << std::setprecision(2);
 			std::cout << "Progress " << (float)consumed / total * 100 << "%   ";
 			std::cout << "Ratio " << (float)compressed / consumed * 100 << "%   ";
-			std::cout << "Speed " << speed / std::pow(2, prefixIndex * 10) << SIZE_SUFFIX[prefixIndex];
+			std::cout << "Speed " << speed / std::pow(2, prefixIndex * 10) << SIZE_SUFFIX[prefixIndex] << "/s";
 			std::cout << "      ";
 		}
 	}
@@ -88,8 +88,9 @@ public:
 const std::string ERROR_MESSAGES[] = {
 	"Invalid archive",
 	"Unknown codec",
-	"No available memory",
-	"File open fail",
+	"Not enough memory\nTry reducing the number of threads used with the -threads=X argument",
+	"Failed to open input file",
+	"Failed to open output file",
 	"Corrupted data",
 	"Invalid argument",
 	"Incorrect password",
@@ -115,10 +116,14 @@ void print_help() {
 				 "\n"
 				 "ADVANCED OPTIONS\n"
 				 "These options will override whathever the selected level uses by default\n"
-				 "--dedup-log=N     Amount of memory to be used by deduplicator, about 2048*2^N bytes.\n"
-				 "                  Setting N to 0 disables deduplication\n"
-				 "--block-log=N     Divide input into blocks of size 2^N bytes. Higher sizes increase\n"
-				 "                   memory and compression.\n"
+				 "--dedup-log=N               Amount of memory to be used by deduplicator, about 1024*2^N bytes.\n"
+				 "                            Setting N to 0 disables deduplication\n"
+				 "--block-log=N               Divide input into blocks of size 2^N bytes. Higher sizes increase\n"
+				 "                             memory and compression.\n"
+				 "--compressor-level=N        Use backend compressor at level N\n"
+				 "--backend-compressor=X      Select compressor to use. Currently available:\n"
+				 "                            strider ; levels [0,9] ; Default, very high ratios with good performance\n"
+				 "                            skanda  ; levels [0,9] ; Similar compression to Zstd but faster decoding\n"
 				 "--disable-solid-block\n"
 				 "--disable-preprocessor\n";
 }
@@ -146,6 +151,8 @@ int main(int argc, char* argv[])
 	std::string password;
 	int dedupLog = -1;
 	int blockLog = -1;
+	int compressorLevel = -1;
+	std::string backendCompressor;
 	bool useSolidBlock = true;
 	bool usePreprocessor = true;
 	for (; argi < argc; argi++) {
@@ -163,10 +170,15 @@ int main(int argc, char* argv[])
 				dedupLog = std::stoi(argv[argi] + 12);
 			else if (strncmp(argv[argi], "--block-log=", 12) == 0) 
 				blockLog = std::stoi(argv[argi] + 12);
+			else if (strncmp(argv[argi], "--compressor-level=", 19) == 0)
+				compressorLevel = std::stoi(argv[argi] + 19);
+			else if (strncmp(argv[argi], "--backend-compressor=", 21) == 0)
+				backendCompressor = argv[argi] + 21;
 			else if (strcmp(argv[argi], "--disable-solid-block") == 0)
 				useSolidBlock = false;
 			else if (strcmp(argv[argi], "--disable-preprocessor") == 0)
 				usePreprocessor = false;
+			
 			else {
 				std::cout << "Invalid parameter " << argv[argi];
 				return -1;
@@ -191,6 +203,7 @@ int main(int argc, char* argv[])
 	for (; argi < argc; argi++)
 		elementPaths.push_back(argv[argi]);
 
+	int error = 0;
 	if (actionCompression) {
 		archiver::Parameters parameters = DEFAULT_PARAMETERS[level];
 		if (!password.empty())
@@ -200,10 +213,14 @@ int main(int argc, char* argv[])
 		if (dedupLog >= 0)
 			parameters.deduplicationMemoryLog = dedupLog;
 		if (blockLog >= 0)
-			parameters.maxBlockSize = 1 << blockLog;
+			parameters.maxBlockSize = (size_t)1 << blockLog;
 		parameters.useSolidBlock = useSolidBlock;
-		if (!usePreprocessor)
+		if (!usePreprocessor && !parameters.codecNameList.empty() && parameters.codecNameList[0] == "spectrum")
 			parameters.codecNameList.erase(parameters.codecNameList.begin());
+		if (backendCompressor != "" && !parameters.codecNameList.empty())
+			parameters.codecNameList[1] = backendCompressor;
+		if (compressorLevel != -1)
+			parameters.compressionLevel = compressorLevel;
 
 		if (parameters.threads == 0) {
 			parameters.threads = std::thread::hardware_concurrency() + 1;
@@ -211,15 +228,13 @@ int main(int argc, char* argv[])
 			do {
 				parameters.threads--;
 				memory = archiver::estimate_memory(parameters);
-			} while (parameters.threads > 1 && memory > get_available_memory());
+			} while (parameters.threads > 1 && memory > get_available_memory() * 0.8);
 		}
 
 		MyArchiveCallback callbacks;
-		int error = archiver::create_archive(elementPaths, archivePath, parameters, &callbacks);
-		if (error) {
-			std::cout << "\nERROR: " << get_error_message(error);
-			return -1;
-		}
+		error = archiver::create_archive(elementPaths, archivePath, parameters, &callbacks);
+		if (!error)
+			std::cout << "\nArchive size: " << std::filesystem::file_size(archivePath) << " bytes";
 	}
 	else {
 		int isEncrypted = archiver::is_archive_encrypted(archivePath);
@@ -233,14 +248,18 @@ int main(int argc, char* argv[])
 		}
 
 		archiver::Parameters parameters;
-		parameters.threads = threads == 0 ? 2 : threads;
-		parameters.password = std::string();
+		//1gb of memory per thread should be enough, unless someone uses bigger blocks
+		parameters.threads = threads == 0 ? get_available_memory() * 0.8 / (1024 * MiB) : threads;
+		parameters.password = password;
 
 		MyArchiveCallback callbacks;
-		int error = archiver::extract_archive(archivePath, elementPaths[0], parameters, &callbacks);
-		if (error) {
-			std::cout << "\nERROR: " << get_error_message(error);
-			return -1;
-		}
+		error = archiver::extract_archive(archivePath, elementPaths[0], parameters, &callbacks);
+		if (!error)
+			std::cout << "\nExtraction successful";
+	}
+
+	if (error) {
+		std::cout << "\nERROR: " << get_error_message(error);
+		return -1;
 	}
 }

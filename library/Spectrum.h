@@ -1,5 +1,5 @@
 /*
- * Spectrum Preprocessor v0.2
+ * Spectrum Preprocessor v0.3
  * Copyright (c) 2022 Carlos de Diego
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -23,8 +23,6 @@ namespace spectrum {
 		size_t(*backendCompressor)(const uint8_t*, const size_t) = nullptr;
 		//Size of the division to test delta filters
 		size_t blockSize = 16384;
-		//Number of previous bytes and post bytes used to determine when a filter helps
-		size_t contextSize = 0;
 		//Size of compressed block with lpc order 1 filter (equivalent of delta filter)
 		// must be at least this number of bytes smaller than the compressed version without lpc filter.
 		size_t lpcO1Threshold = 512;
@@ -51,6 +49,8 @@ namespace spectrum {
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <bitset>
+#include <memory>
 
 #if defined(_MSC_VER)
 	#define FORCE_INLINE __forceinline
@@ -90,7 +90,6 @@ namespace spectrum {
 		const union { uint16_t u; uint8_t c[2]; } LITTLE_ENDIAN_CHECK = { 1 };
 		return LITTLE_ENDIAN_CHECK.c[0];
 	}
-
 
 //Undefined behaviour if value == 0
 	FORCE_INLINE size_t unsafe_int_log2(size_t value) {
@@ -362,7 +361,7 @@ namespace spectrum {
 
 		uint32_t histogram[8][256];
 		get_histogram8(buf, bufSize, histogram);
-
+		
 		const float probDiv = 1 / float(bufSize);
 		float entropy = 0;
 
@@ -409,7 +408,7 @@ namespace spectrum {
 			lastSeen[3][b4] = itD++;
 		}
 
-		int channels = 0;
+		int channels = 1;
 		size_t highestCount = 0;
 		for (int i = 1; i < 256; i++) {
 			size_t thisCount = distanceCount[0][i] + distanceCount[1][i] + distanceCount[2][i] + distanceCount[3][i];
@@ -533,14 +532,14 @@ namespace spectrum {
 	}
 
 	const int BINARY_MODEL_PRECISION_BITS = 12;
-	const int BINARY_MODEL_FULL_RANGE = (1 << BINARY_MODEL_PRECISION_BITS) - 1;
+	const int BINARY_MODEL_FULL_RANGE = 1 << BINARY_MODEL_PRECISION_BITS;
 	const int BINARY_MODEL_MID_RANGE = 1 << BINARY_MODEL_PRECISION_BITS - 1;
-	const int BINARY_MODEL_UPDATE_SPEED = 4;
+	const int BINARY_MODEL_UPDATE_SPEED = 5;
 
-	class binary_model {
+	class BinaryModel {
 	public:
 		uint16_t model = BINARY_MODEL_MID_RANGE;
-		binary_model() {}
+		BinaryModel() {}
 
 		void update(bool bit) {
 			model += (bit ? (1 << BINARY_MODEL_UPDATE_SPEED) - 1 : BINARY_MODEL_FULL_RANGE) - model >> BINARY_MODEL_UPDATE_SPEED;
@@ -549,7 +548,7 @@ namespace spectrum {
 			return (-bit) & model;
 		}
 		uint16_t get_freq(bool bit) {
-			return model ^ (-bit & BINARY_MODEL_FULL_RANGE);
+			return bit ? BINARY_MODEL_FULL_RANGE - model : model;
 		}
 		uint16_t get_mid() const {
 			return model;
@@ -607,7 +606,7 @@ namespace spectrum {
 			streamIt += finalBlockSize;
 		}
 
-		void encode_bit(binary_model* model, const uint8_t bit) {
+		void encode_bit(BinaryModel* model, const uint8_t bit) {
 			dataBuffer[bitsStored] = (model->get_freq(bit) << BINARY_MODEL_PRECISION_BITS) | model->get_low(bit);
 			bitsStored++;
 			model->update(bit);
@@ -629,239 +628,6 @@ namespace spectrum {
 			return streamIt - streamBegin;
 		}
 	};
-
-	const int CALL_ADDRESS = 0;
-	const int JUMP_ADDRESS = 1;
-	const int MOV_ADDRESS = 2;
-	const int LEA_ADDRESS = 3;
-
-	//Based on Igor's BCJ2 and Shelwien's x64flt3
-	size_t x86_encode(const uint8_t* input, const size_t size, uint8_t* output) {
-
-		const uint8_t* const start = input;
-		//Allows to read up to 4 bytes of opcode and 4 bytes of address
-		const uint8_t* const end = size < 7 ? input : input + size - 7;
-
-		uint32_t* addressBuf = nullptr;
-		uint8_t* addressTypeBuf = nullptr;
-		uint8_t* bitBuf = nullptr;
-		HashTable<uint8_t, FastIntHash> bcjTable;
-		try {
-			//Each instruction takes 1 byte for the opcode and 4 for the offset, so it is impossible to have more than NUMBER_BYTES / 5 instructions
-			addressBuf = new uint32_t[size / 5 + 1];
-			addressTypeBuf = new uint8_t[size / 5 + 1];
-			bitBuf = new uint8_t[size / 8 + 1]();
-			bcjTable.init(21);
-		}
-		catch (std::bad_alloc& e) {
-			delete[] addressBuf;
-			delete[] addressTypeBuf;
-			delete[] bitBuf;
-			return -1;
-		}
-
-		uint32_t* addressIt = addressBuf;
-		uint8_t* addressTypeIt = addressTypeBuf;
-		RansEncoder ransEncoder;
-		ransEncoder.start_rans(bitBuf);
-		binary_model e8Model[256];
-		binary_model e9Model[256];
-		binary_model jumpModel[256];
-
-		size_t callAddressCount = 0;
-		size_t jumpAddressCount = 0;
-		size_t movAddressCount = 0;
-		size_t leaAddressCount = 0;
-
-		uint8_t* mainIt = output;
-
-		for (; input < end; ) {
-
-			//Perform two passes: first one is to know which addresses are repeated so that we dont have false E8 and E9.
-			//I have decided to do this in blocks. Very large ones could start getting more collisions, and thus reduce compression.
-			const size_t BLOCK_SIZE = 1 << 21;
-			const uint8_t* nextCheckpoint = end - input < BLOCK_SIZE * 5 / 4 ? end : input + BLOCK_SIZE;
-
-			bcjTable.reset();
-			for (const uint8_t* it = input; it < nextCheckpoint; ) {
-				const uint32_t opcode = read_uint16le(it);
-
-				if ((opcode & 0xFE) == 0xE8) {
-					it++;
-					uint32_t address = read_uint32le(it);
-					address += (it - start);
-
-					uint8_t* entry = &bcjTable[address];
-					*entry += (*entry < 2);
-					it += 4;
-				}
-				else if ((opcode & 0xF0FF) == 0x800F) {
-					it += 2;
-					uint32_t address = read_uint32le(it);
-					address += (it - start);
-
-					uint8_t* entry = &bcjTable[address];
-					*entry += (*entry < 2);
-					it += 4;
-				}
-				else {
-					it++;
-				}
-			}
-
-			for (; input < nextCheckpoint; ) {
-
-				//First byte is sent as is
-				if (input == start) {
-					*mainIt++ = *input++;
-					continue;
-				}
-				const uint32_t opcode = read_uint32le(input);
-
-				if ((opcode & 0xFF) == 0xE8) { //Call
-					*mainIt++ = 0xE8;
-					input++;
-
-					uint32_t relative = read_uint32le(input);
-					uint32_t address = relative + (input - start);
-
-					//If the relative offset is very small, then it probably is a CALL instruction
-					if (bcjTable[address] >= 2 || std::abs(int(relative)) < 0x10000) {
-						ransEncoder.encode_bit(&e8Model[input[-2]], 1);
-						*addressIt++ = address;
-						*addressTypeIt++ = CALL_ADDRESS;
-						callAddressCount++;
-						input += 4;
-					}
-					else
-						ransEncoder.encode_bit(&e8Model[input[-2]], 0);
-				}
-				else if ((opcode & 0xFF) == 0xE9) { //Jump
-					*mainIt++ = 0xE9;
-					input++;
-
-					uint32_t relative = read_uint32le(input);
-					uint32_t address = relative + (input - start);
-
-					//If the relative offset is very small, then it probably is a JUMP instruction
-					if (bcjTable[address] >= 2 || std::abs(int(relative)) < 0x10000) {
-						ransEncoder.encode_bit(&e9Model[input[-2]], 1);
-						*addressIt++ = address;
-						*addressTypeIt++ = JUMP_ADDRESS;
-						jumpAddressCount++;
-						input += 4;
-					}
-					else
-						ransEncoder.encode_bit(&e9Model[input[-2]], 0);
-				}
-				else if ((opcode & 0xF0FF) == 0x800F) { //Branch
-
-					write_uint16le(mainIt, opcode & 0xFFFF);
-					mainIt += 2;
-					input += 2;
-
-					uint32_t relative = read_uint32le(input);
-					uint32_t address = relative + (input - start);
-
-					//If the relative offset is very small, then it probably is a JUMP instruction
-					if (bcjTable[address] >= 2 || std::abs(int(relative)) < 0x10000) {
-						ransEncoder.encode_bit(&jumpModel[input[-3]], 1);
-						*addressIt++ = address;
-						*addressTypeIt++ = JUMP_ADDRESS;
-						jumpAddressCount++;
-						input += 4;
-					}
-					else
-						ransEncoder.encode_bit(&jumpModel[input[-3]], 0);
-				}
-				else if ((opcode & 0xC7FD) == 0x0589) { //MOV reg,[addr], mov [addr],reg
-					write_uint16le(mainIt, opcode & 0xFFFF);
-					mainIt += 2;
-					input += 2;
-
-					uint32_t address = read_uint32le(input);
-					address += (input - start);
-
-					*addressIt++ = address;
-					*addressTypeIt++ = MOV_ADDRESS;
-					movAddressCount++;
-					input += 4;
-				}
-				else if ((opcode & 0xC7FFFB) == 0x058D48) { //REX + LEA
-					write_uint32le(mainIt, opcode & 0xFFFFFF);
-					mainIt += 3;
-					input += 3;
-
-					uint32_t address = read_uint32le(input);
-					address += (input - start);
-
-					*addressIt++ = address;
-					*addressTypeIt++ = LEA_ADDRESS;
-					leaAddressCount++;
-					input += 4;
-				}
-				else {
-					*mainIt++ = opcode & 0xFF;
-					input++;
-				}
-			}
-		}
-
-		while (input < start + size)
-			*mainIt++ = *input++;
-
-		size_t mainSize = mainIt - output;
-		size_t bitSize = ransEncoder.end_rans();
-
-		size_t metadataBytes = 0;
-		metadataBytes += 1 + int_log2(callAddressCount) / 7;
-		metadataBytes += 1 + int_log2(jumpAddressCount) / 7;
-		metadataBytes += 1 + int_log2(movAddressCount) / 7;
-		metadataBytes += 1 + int_log2(leaAddressCount) / 7;
-		metadataBytes += 1 + int_log2(bitSize) / 7;
-
-		uint8_t* callBuf = output + metadataBytes;
-		uint8_t* jumpBuf = callBuf + callAddressCount * 4;
-		uint8_t* movBuf = jumpBuf + jumpAddressCount * 4;
-		uint8_t* leaBuf = movBuf + movAddressCount * 4;
-		memmove(leaBuf + leaAddressCount * 4 + bitSize, output, mainSize);
-		memcpy(leaBuf + leaAddressCount * 4, bitBuf, bitSize);
-		size_t totalSize = metadataBytes + size + bitSize;
-
-		const size_t totalAddressCount = callAddressCount + jumpAddressCount + movAddressCount + leaAddressCount;
-		for (size_t i = 0; i < totalAddressCount; i++) {
-			switch (addressTypeBuf[i]) {
-			case CALL_ADDRESS:
-				write_uint32le(callBuf, addressBuf[i]);
-				callBuf += 4;
-				break;
-			case JUMP_ADDRESS:
-				write_uint32le(jumpBuf, addressBuf[i]);
-				jumpBuf += 4;
-				break;
-			case MOV_ADDRESS:
-				write_uint32le(movBuf, addressBuf[i]);
-				movBuf += 4;
-				break;
-			case LEA_ADDRESS:
-				write_uint32le(leaBuf, addressBuf[i]);
-				leaBuf += 4;
-				break;
-			}
-		}
-
-		write_LEB128(output, callAddressCount);
-		write_LEB128(output, jumpAddressCount);
-		write_LEB128(output, movAddressCount);
-		write_LEB128(output, leaAddressCount);
-		write_LEB128(output, bitSize);
-
-		delete[] addressBuf;
-		delete[] addressTypeBuf;
-		delete[] bitBuf;
-
-		return totalSize;
-	}
 
 	class RansDecoder {
 		uint32_t state;
@@ -887,11 +653,11 @@ namespace spectrum {
 			state = (0 - renormalize & (newState ^ state)) ^ state;
 			compressedStreamIt += renormalize << 1;
 		}
-		size_t decode_bit(binary_model* model) {
+		size_t decode_bit(BinaryModel* model) {
 			if (readBits % RANS_FLUSH_PERIOD == 0)
 				start_block();
 
-			size_t stateLow = state & BINARY_MODEL_FULL_RANGE;
+			size_t stateLow = state & (BINARY_MODEL_FULL_RANGE - 1);
 			size_t bit = stateLow >= model->get_mid();
 			state = model->get_freq(bit) * (state >> BINARY_MODEL_PRECISION_BITS) + stateLow - model->get_low(bit);
 			model->update(bit);
@@ -901,18 +667,197 @@ namespace spectrum {
 		}
 	};
 
+	const int CALL_ADDRESS = 0;
+	const int JUMP_ADDRESS = 1;
+	const int MOVLEA_ADDRESS = 2;
+
+	//Based on Igor's BCJ2 and Shelwien's x64flt3
+	size_t x86_encode(const uint8_t* input, const size_t size, uint8_t* output) {
+
+		const uint8_t* const start = input;
+		//Allows to read up to 4 bytes of opcode and 4 bytes of address
+		const uint8_t* const end = size < 7 ? input : input + size - 7;
+
+		uint32_t* addressBuf = nullptr;
+		uint8_t* addressTypeBuf = nullptr;
+		uint8_t* bitBuf = nullptr;
+
+		try {
+			//Each instruction takes 1 byte for the opcode and 4 for the offset, so it is impossible to have more than NUMBER_BYTES / 5 instructions
+			addressBuf = new uint32_t[size / 5 + 1];
+			addressTypeBuf = new uint8_t[size / 5 + 1];
+			bitBuf = new uint8_t[size / 8 + 1]();
+		}
+		catch (std::bad_alloc& e) {
+			delete[] addressBuf;
+			delete[] addressTypeBuf;
+			delete[] bitBuf;
+			return -1;
+		}
+
+		uint32_t* addressIt = addressBuf;
+		uint8_t* addressTypeIt = addressTypeBuf;
+		RansEncoder ransEncoder;
+		ransEncoder.start_rans(bitBuf);
+		BinaryModel bitModel[512];
+
+		size_t callAddressCount = 0;
+		size_t jumpAddressCount = 0;
+		size_t movLeaAddressCount = 0;
+
+		uint8_t* mainIt = output;
+		//First byte is sent as is
+		*mainIt++ = *input++;
+
+		for (; input < end; ) {
+
+			//Perform two passes: first one is to know which addresses are repeated so that we dont have false E8 and E9.
+			//I have decided to do this in blocks. Very large ones could start getting more collisions, and thus reduce compression.
+			const size_t BLOCK_SIZE = 1 << 22;
+			const uint8_t* nextCheckpoint = end - input < BLOCK_SIZE * 5 / 4 ? end : input + BLOCK_SIZE;
+
+			const size_t HASH_SIZE = 1 << 22;
+			std::bitset<HASH_SIZE>* bcjEncountered = new (std::nothrow) std::bitset<HASH_SIZE>;
+			std::bitset<HASH_SIZE>* bcjDuplicate = new (std::nothrow) std::bitset<HASH_SIZE>;
+			if (!bcjEncountered || !bcjDuplicate) {
+				delete bcjEncountered;
+				return -1;
+			}
+
+			for (const uint8_t* it = input; it < nextCheckpoint; ) {
+				const uint32_t opcode = read_uint16le(it - 1);
+				it++;
+
+				if ((opcode & 0xFE00) == 0xE800 || (opcode & 0xF0FF) == 0x800F) {
+					uint32_t address = read_uint32le(it);
+					address += (it - start);
+
+					size_t hash = FastIntHash{}(address) % HASH_SIZE;
+					bool isDuplicate = bcjEncountered->test(hash);
+					bcjEncountered->set(hash);
+					(*bcjDuplicate)[hash] = isDuplicate;
+					it += 4;
+				}
+			}
+
+			for (; input < nextCheckpoint; ) {
+
+				const uint32_t opcode = read_uint32le(input);
+				write_uint32le(mainIt, opcode);
+
+				if ((opcode & 0xFE) == 0xE8) { //Call and jump
+					mainIt++;
+					input++;
+
+					uint32_t relative = read_uint32le(input);
+					uint32_t address = relative + (input - start);
+
+					size_t isJump = opcode & 1;
+					//If the relative offset is very small, then it probably is a CALL instruction
+					if (bcjDuplicate->test(FastIntHash{}(address) % HASH_SIZE) || std::abs(int(relative)) < 0x10000) {
+						ransEncoder.encode_bit(&bitModel[(isJump << 8) | input[-2]], 1);
+						*addressIt++ = address;
+						*addressTypeIt++ = isJump ? JUMP_ADDRESS : CALL_ADDRESS;
+						callAddressCount += isJump ^ 1;
+						jumpAddressCount += isJump;
+						input += 4;
+					}
+					else
+						ransEncoder.encode_bit(&bitModel[(isJump << 8) | input[-2]], 0);
+
+					continue;
+				}
+
+				bool isBranch = (opcode & 0xF0FF) == 0x800F;
+				bool isMov = (opcode & 0xC7FD) == 0x0589;
+				bool isLea = (opcode & 0xC7FFFB) == 0x058D48;
+				if (isBranch || isMov || isLea) { //MOV reg,[addr], mov [addr],reg or REX + LEA
+					size_t bytes = 2 + isLea;
+					mainIt += bytes;
+					input += bytes;
+
+					uint32_t address = read_uint32le(input);
+					address += (input - start);
+
+					*addressIt++ = address;
+					*addressTypeIt++ = (isBranch ? JUMP_ADDRESS : MOVLEA_ADDRESS);
+					jumpAddressCount += isBranch;
+					movLeaAddressCount += isBranch ^ 1;
+					input += 4;
+				}
+
+				else {
+					mainIt++;
+					input++;
+				}
+			}
+
+			delete bcjEncountered;
+			delete bcjDuplicate;
+		}
+
+		while (input < start + size)
+			*mainIt++ = *input++;
+
+		size_t mainSize = mainIt - output;
+		size_t bitSize = ransEncoder.end_rans();
+
+		size_t metadataBytes = 0;
+		metadataBytes += 1 + int_log2(callAddressCount) / 7;
+		metadataBytes += 1 + int_log2(jumpAddressCount) / 7;
+		metadataBytes += 1 + int_log2(movLeaAddressCount) / 7;
+		metadataBytes += 1 + int_log2(bitSize) / 7;
+
+		uint8_t* callBuf = output + metadataBytes;
+		uint8_t* jumpBuf = callBuf + callAddressCount * 4;
+		uint8_t* movLeaBuf = jumpBuf + jumpAddressCount * 4;
+		memmove(movLeaBuf + movLeaAddressCount * 4 + bitSize, output, mainSize);
+		memcpy(movLeaBuf + movLeaAddressCount * 4, bitBuf, bitSize);
+		size_t totalSize = metadataBytes + size + bitSize;
+
+		const size_t totalAddressCount = callAddressCount + jumpAddressCount + movLeaAddressCount;
+		for (size_t i = 0; i < totalAddressCount; i++) {
+			switch (addressTypeBuf[i]) {
+			case CALL_ADDRESS:
+				write_uint32le(callBuf, addressBuf[i]);
+				callBuf += 4;
+				break;
+			case JUMP_ADDRESS:
+				write_uint32le(jumpBuf, addressBuf[i]);
+				jumpBuf += 4;
+				break;
+			case MOVLEA_ADDRESS:
+				write_uint32le(movLeaBuf, addressBuf[i]);
+				movLeaBuf += 4;
+				break;
+			}
+		}
+
+		write_LEB128(output, callAddressCount);
+		write_LEB128(output, jumpAddressCount);
+		write_LEB128(output, movLeaAddressCount);
+		write_LEB128(output, bitSize);
+
+		delete[] addressBuf;
+		delete[] addressTypeBuf;
+		delete[] bitBuf;
+
+		return totalSize;
+	}
+
 	size_t x86_decode(const uint8_t* encoded, const uint8_t* const encodedEnd, const size_t size, uint8_t* decoded) {
+
+		if (size == 0)
+			return 0;
 
 		const uint8_t* const metadataStart = encoded;
 
-		size_t callSize, jumpSize, movSize, leaSize, bitSize;
+		size_t callSize, jumpSize, movLeaSize, bitSize;
 		if (read_LEB128(encoded, encodedEnd, &callSize))
 			return -1;
 		if (read_LEB128(encoded, encodedEnd, &jumpSize))
 			return -1;
-		if (read_LEB128(encoded, encodedEnd, &movSize))
-			return -1;
-		if (read_LEB128(encoded, encodedEnd, &leaSize))
+		if (read_LEB128(encoded, encodedEnd, &movLeaSize))
 			return -1;
 		if (read_LEB128(encoded, encodedEnd, &bitSize))
 			return -1;
@@ -923,125 +868,89 @@ namespace spectrum {
 			return -1;
 		if (jumpSize * 4 > encodedEnd - encoded - callSize * 4)
 			return -1;
-		if (movSize * 4 > encodedEnd - encoded - callSize * 4 - jumpSize * 4)
+		if (movLeaSize * 4 > encodedEnd - encoded - callSize * 4 - jumpSize * 4)
 			return -1;
-		if (leaSize * 4 > encodedEnd - encoded - callSize * 4 - jumpSize * 4 - movSize * 4)
-			return -1;
-		if (bitSize > encodedEnd - encoded - callSize * 4 - jumpSize * 4 - movSize * 4 - leaSize * 4)
+		if (bitSize > encodedEnd - encoded - callSize * 4 - jumpSize * 4 - movLeaSize)
 			return -1;
 		//There must be at least 4 bytes for main to be able to read the opcode OR the stream is very small
-		if (encodedEnd - encoded - callSize * 4 - jumpSize * 4 - movSize * 4 - leaSize * 4 - bitSize < std::min((size_t)(encodedEnd - encoded), (size_t)4))
+		if (encodedEnd - encoded - callSize * 4 - jumpSize * 4 - movLeaSize * 4 - bitSize < std::min((size_t)(encodedEnd - encoded), (size_t)4))
 			return -1;
 
 		const size_t metadataSize = encoded - metadataStart;
 
 		const uint8_t* callIt = encoded;
 		const uint8_t* jumpIt = callIt + callSize * 4;
-		const uint8_t* movIt = jumpIt + jumpSize * 4;
-		const uint8_t* leaIt = movIt + movSize * 4;
-		const uint8_t* bitBuf = leaIt + leaSize * 4;
+		const uint8_t* movLeaIt = jumpIt + jumpSize * 4;
+		const uint8_t* bitBuf = movLeaIt + movLeaSize * 4;
 		const uint8_t* mainIt = bitBuf + bitSize;
 
 		RansDecoder ransDecoder;
 		ransDecoder.start_rans(bitBuf);
-		binary_model e8Model[256];
-		binary_model e9Model[256];
-		binary_model jumpModel[256];
+		BinaryModel bitModel[512];
 
 		const uint8_t* const start = decoded;
 		const uint8_t* end = size < 7 ? decoded : decoded + size - 7;
+
+		//First byte is sent as is
+		*decoded++ = *mainIt++;
 
 		for (; decoded < end;) {
 
 			//On a correct stream we will always have more than 4 bytes to read
 			if (encodedEnd - mainIt < 4)
 				return -1;
-			//First byte is sent as is
-			if (decoded == start) {
-				*decoded++ = *mainIt++;
-				continue;
-			}
-			const uint32_t opcode = read_uint32le(mainIt);
 
-			if ((opcode & 0xFF) == 0xE8) {
-				*decoded++ = 0xE8;
+			const uint32_t opcode = read_uint32le(mainIt);
+			write_uint32le(decoded, opcode);
+
+			if ((opcode & 0xFE) == 0xE8) {
+				decoded++;
 				mainIt++;
 
+				size_t isJump = opcode & 1;
 				//bitBuf always starts behind mainIt, and it will advance slower, 
 				// so if mainIt is not out of bounds, neither is bitBuf.
-				if (ransDecoder.decode_bit(&e8Model[decoded[-2]])) {
+				if (ransDecoder.decode_bit(&bitModel[(isJump << 8) | decoded[-2]])) {
 					//Would read from next buffer, but not from out of bounds
-					if (jumpIt - callIt < 4)
-						return -1;
-					uint32_t address = read_uint32le(callIt);
-					callIt += 4;
+					uint32_t callAddress = read_uint32le(callIt);
+					uint32_t jumpAddress = read_uint32le(jumpIt);
+					callIt += (isJump ^ 1) << 2;
+					jumpIt += isJump << 2;
 
-					address -= (decoded - start);
+					if (callIt > jumpIt || jumpIt > movLeaIt)
+						return -1;
+
+					uint32_t address = (isJump ? jumpAddress : callAddress) - (decoded - start);
 					memcpy(decoded, &address, 4);
 					decoded += 4;
 				}
+
+				continue;
 			}
-			else if ((opcode & 0xFF) == 0xE9) {
-				*decoded++ = 0xE9;
-				mainIt++;
 
-				if (ransDecoder.decode_bit(&e9Model[decoded[-2]])) {
-					if (movIt - jumpIt < 4)
-						return -1;
-					uint32_t address = read_uint32le(jumpIt);
-					jumpIt += 4;
+			bool isBranch = (opcode & 0xF0FF) == 0x800F;
+			bool isMov = (opcode & 0xC7FD) == 0x0589;
+			bool isLea = (opcode & 0xC7FFFB) == 0x058D48;
+			if (isBranch || isMov || isLea) {
+				size_t bytes = 2 + isLea;
+				decoded += bytes;
+				mainIt += bytes;
 
-					address -= (decoded - start);
-					memcpy(decoded, &address, 4);
-					decoded += 4;
-				}
-			}
-			else if ((opcode & 0xF0FF) == 0x800F) {
-				write_uint16le(decoded, opcode & 0xFFFF);
-				decoded += 2;
-				mainIt += 2;
+				uint32_t jumpAddress = read_uint32le(jumpIt);
+				uint32_t movLeaAddress = read_uint32le(movLeaIt);
+				jumpIt += isBranch << 2;
+				movLeaIt += (isBranch ^ 1) << 2;
 
-				if (ransDecoder.decode_bit(&jumpModel[decoded[-3]])) {
-					if (movIt - jumpIt < 4)
-						return -1;
-					uint32_t address = read_uint32le(jumpIt);
-					jumpIt += 4;
-
-					address -= (decoded - start);
-					memcpy(decoded, &address, 4);
-					decoded += 4;
-				}
-			}
-			else if ((opcode & 0xC7FD) == 0x0589) {
-				write_uint16le(decoded, opcode & 0xFFFF);
-				decoded += 2;
-				mainIt += 2;
-
-				if (leaIt - movIt < 4)
+				if (jumpIt > movLeaIt || movLeaIt > bitBuf)
 					return -1;
-				uint32_t address = read_uint32le(movIt);
-				movIt += 4;
 
-				address -= (decoded - start);
+				uint32_t address = (isBranch ? jumpAddress : movLeaAddress) - (decoded - start);
 				memcpy(decoded, &address, 4);
 				decoded += 4;
 			}
-			else if ((opcode & 0xC7FFFB) == 0x058D48) {
-				write_uint32le(decoded, opcode & 0xFFFFFF);
-				decoded += 3;
-				mainIt += 3;
 
-				if (bitBuf - leaIt < 4)
-					return -1;
-				uint32_t address = read_uint32le(leaIt);
-				leaIt += 4;
-
-				address -= (decoded - start);
-				memcpy(decoded, &address, 4);
-				decoded += 4;
-			}
 			else {
-				*decoded++ = opcode & 0xFF;
+				decoded++;
 				mainIt++;
 			}
 		}
@@ -1231,18 +1140,22 @@ namespace spectrum {
 		return size;
 	}
 
-	const int NONE_FILTER = 0;
-	const int X86_FILTER = 1;
-	const int LPC_FILTER = 2;
+	enum {
+		NONE_FILTER, X86_FILTER, LPC_FILTER
+	};
 
 	struct PreprocessorBlock {
 		size_t filter;
+		size_t position;
 		size_t size;
 		//For linear prediction
 		int order;
 		int channels;
 		int channelWidth;
 		int offset;
+		//For miscelaneous filters/recompressors
+		uint8_t* extraData = nullptr;
+		size_t extraDataLength;
 
 		bool operator==(const PreprocessorBlock& other) {
 			if (filter != other.filter)
@@ -1258,18 +1171,11 @@ namespace spectrum {
 
 	size_t encode(const uint8_t* input, const size_t size, uint8_t* output, EncoderOptions options) {
 
-		//Buffer used to store lpc transform, and determine if it helps compression
-		uint8_t* lpcO1Buf = nullptr;
-		uint8_t* lpcO2Buf = nullptr;
-		uint8_t* lpcO3Buf = nullptr;
 		HashTable<uint32_t, FastIntHash> jumpTable;
 		std::vector<PreprocessorBlock> filters;
 		try {
 			filters.reserve(size / options.blockSize + 1);
 			filters.push_back({ 255, 0, 0 });
-			lpcO1Buf = new uint8_t[options.blockSize];
-			lpcO2Buf = new uint8_t[options.blockSize];
-			lpcO3Buf = new uint8_t[options.blockSize];
 			jumpTable.init(12);
 		}
 		catch (std::bad_alloc& e) {
@@ -1278,10 +1184,6 @@ namespace spectrum {
 
 		const uint8_t* const inputStart = input;
 		const uint8_t* const inputEnd = input + size;
-		//Store the last filtered blocks, and use them to detect with higher precision
-		// whether to use delta in the following blocks. We can use the output buffer for this.
-		uint8_t* filteredDataBuffer = output;
-		size_t filteredDataPos = 0;
 
 		for (; input < inputEnd; ) {
 
@@ -1293,7 +1195,7 @@ namespace spectrum {
 				if (filters.size() > 1)
 					filters.back().size += thisBlockSize;
 				else
-					filters.push_back({ NONE_FILTER, thisBlockSize });
+					filters.push_back({ NONE_FILTER, size_t(input - inputStart), thisBlockSize });
 				input += thisBlockSize;
 				continue;
 			}
@@ -1382,9 +1284,7 @@ namespace spectrum {
 					if (filters.back().filter == X86_FILTER)
 						filters.back().size += x86Size;
 					else
-						filters.push_back({ X86_FILTER, x86Size });
-					memcpy(filteredDataBuffer + filteredDataPos, input, x86Size);
-					filteredDataPos += x86Size;
+						filters.push_back({ X86_FILTER, size_t(input - inputStart), x86Size });
 					input += x86Size;
 					continue;
 				}
@@ -1395,6 +1295,7 @@ namespace spectrum {
 			//Find channels
 			PreprocessorBlock lpcO1Filter;
 			lpcO1Filter.filter = LPC_FILTER;
+			lpcO1Filter.position = input - inputStart;
 			lpcO1Filter.size = thisBlockSize;
 			lpcO1Filter.order = 1;
 			lpcO1Filter.channelWidth = 1;
@@ -1404,8 +1305,8 @@ namespace spectrum {
 			else {
 				float bestEntropy = 9;
 				for (size_t channels = 1; channels <= 16; channels++) {
-					lpc_encode(thisBlockStart, thisBlockSize, lpcO1Buf, 1, channels, 1, 0);
-					float entropy = calculate_entropy(lpcO1Buf, thisBlockSize);
+					lpc_encode(thisBlockStart, thisBlockSize, output, 1, channels, 1, 0);
+					float entropy = calculate_entropy(output, thisBlockSize);
 					if (entropy < bestEntropy) {
 						lpcO1Filter.channels = channels;
 						bestEntropy = entropy;
@@ -1419,8 +1320,8 @@ namespace spectrum {
 			//FAST CHECK: compare entropies
 			float rawEntropy, lpcO1Entropy;
 			if (!failedCheck) {
-				lpc_encode(thisBlockStart, thisBlockSize, lpcO1Buf, 1, lpcO1Filter.channels, lpcO1Filter.channelWidth, lpcO1Filter.offset);
-				lpcO1Entropy = calculate_entropy(lpcO1Buf, thisBlockSize);
+				lpc_encode(thisBlockStart, thisBlockSize, output, 1, lpcO1Filter.channels, lpcO1Filter.channelWidth, lpcO1Filter.offset);
+				lpcO1Entropy = calculate_entropy(output, thisBlockSize);
 				rawEntropy = calculate_entropy(thisBlockStart, thisBlockSize);
 				if (lpcO1Entropy + (float)options.lpcO1Threshold / options.blockSize * 8 > rawEntropy)
 					failedCheck = true;
@@ -1429,10 +1330,8 @@ namespace spectrum {
 			//To improve results, also the last blocks will be used, if available
 			size_t rawSize, lpcO1Size;
 			if (!failedCheck) {
-				memcpy(filteredDataBuffer + filteredDataPos, input, thisBlockSize);
-				rawSize = dummy_compressor(filteredDataBuffer + filteredDataPos, thisBlockSize);
-				memcpy(filteredDataBuffer + filteredDataPos, lpcO1Buf, thisBlockSize);
-				lpcO1Size = dummy_compressor(filteredDataBuffer + filteredDataPos, thisBlockSize);
+				rawSize = dummy_compressor(thisBlockStart, thisBlockSize);
+				lpcO1Size = dummy_compressor(output, thisBlockSize);
 				failedCheck = lpcO1Size + options.lpcO1Threshold > rawSize;
 			}
 
@@ -1440,9 +1339,7 @@ namespace spectrum {
 				if (filters.back().filter == NONE_FILTER)
 					filters.back().size += thisBlockSize;
 				else
-					filters.push_back({ NONE_FILTER, thisBlockSize });
-				memcpy(filteredDataBuffer + filteredDataPos, input, thisBlockSize);
-				filteredDataPos += thisBlockSize;
+					filters.push_back({ NONE_FILTER, size_t(input - inputStart), thisBlockSize });
 				input += thisBlockSize;
 				continue;
 			}
@@ -1454,8 +1351,8 @@ namespace spectrum {
 				size_t channels = lpcO2Filter.channels;
 				for (size_t channelWidth = 1; channelWidth <= 2; channelWidth++) {
 					for (size_t offset = 0; offset < channelWidth; offset++) {
-						lpc_encode(thisBlockStart, thisBlockSize, lpcO2Buf, 2, channels / channelWidth, channelWidth, offset);
-						float entropy = calculate_entropy(lpcO2Buf, thisBlockSize);
+						lpc_encode(thisBlockStart, thisBlockSize, output, 2, channels / channelWidth, channelWidth, offset);
+						float entropy = calculate_entropy(output, thisBlockSize);
 						if (entropy < bestEntropy) {
 							lpcO2Filter.channels = channels / channelWidth;
 							lpcO2Filter.channelWidth = channelWidth;
@@ -1466,14 +1363,13 @@ namespace spectrum {
 				}
 			}
 			
-			lpc_encode(thisBlockStart, thisBlockSize, lpcO2Buf, 2, lpcO2Filter.channels, lpcO2Filter.channelWidth, lpcO2Filter.offset);
-			float lpcO2Entropy = calculate_entropy(lpcO2Buf, thisBlockSize);
+			lpc_encode(thisBlockStart, thisBlockSize, output, 2, lpcO2Filter.channels, lpcO2Filter.channelWidth, lpcO2Filter.offset);
+			float lpcO2Entropy = calculate_entropy(output, thisBlockSize);
 			failedCheck = lpcO2Entropy + (float)options.lpcO2Threshold / options.blockSize * 8 > lpcO1Entropy;
 			size_t lpcO2Size;
 
 			if (!failedCheck) {
-				memcpy(filteredDataBuffer + filteredDataPos, lpcO2Buf, thisBlockSize);
-				lpcO2Size = dummy_compressor(filteredDataBuffer + filteredDataPos, thisBlockSize);
+				lpcO2Size = dummy_compressor(output, thisBlockSize);
 				failedCheck = lpcO2Size + options.lpcO2Threshold > lpcO1Size;
 			}
 			
@@ -1482,8 +1378,6 @@ namespace spectrum {
 					filters.back().size += thisBlockSize;
 				else
 					filters.push_back(lpcO1Filter);
-				memcpy(filteredDataBuffer + filteredDataPos, lpcO1Buf, thisBlockSize);
-				filteredDataPos += thisBlockSize;
 				input += thisBlockSize;
 				continue;
 			}
@@ -1491,14 +1385,13 @@ namespace spectrum {
 			PreprocessorBlock lpcO3Filter = lpcO2Filter;
 			lpcO3Filter.order = 3;
 
-			lpc_encode(thisBlockStart, thisBlockSize, lpcO3Buf, 3, lpcO3Filter.channels, lpcO3Filter.channelWidth, lpcO3Filter.offset);
-			float lpcO3Entropy = calculate_entropy(lpcO3Buf, thisBlockSize);
+			lpc_encode(thisBlockStart, thisBlockSize, output, 3, lpcO3Filter.channels, lpcO3Filter.channelWidth, lpcO3Filter.offset);
+			float lpcO3Entropy = calculate_entropy(output, thisBlockSize);
 			failedCheck = lpcO3Entropy + (float)options.lpcO3Threshold / options.blockSize * 8 > lpcO2Entropy;
 			size_t lpcO3Size;
 
 			if (!failedCheck) {
-				memcpy(filteredDataBuffer + filteredDataPos, lpcO3Buf, thisBlockSize);
-				lpcO3Size = dummy_compressor(filteredDataBuffer + filteredDataPos, thisBlockSize);
+				lpcO3Size = dummy_compressor(output, thisBlockSize);
 				failedCheck = lpcO3Size + options.lpcO3Threshold > lpcO2Size;
 			}
 
@@ -1507,8 +1400,6 @@ namespace spectrum {
 					filters.back().size += thisBlockSize;
 				else
 					filters.push_back(lpcO2Filter);
-				memcpy(filteredDataBuffer + filteredDataPos, lpcO2Buf, thisBlockSize);
-				filteredDataPos += thisBlockSize;
 				input += thisBlockSize;
 				continue;
 			}
@@ -1517,14 +1408,8 @@ namespace spectrum {
 				filters.back().size += thisBlockSize;
 			else
 				filters.push_back(lpcO3Filter);
-			memcpy(filteredDataBuffer + filteredDataPos, lpcO3Buf, thisBlockSize);
-			filteredDataPos += thisBlockSize;
 			input += thisBlockSize;
 		}
-
-		delete[] lpcO1Buf;
-		delete[] lpcO2Buf;
-		delete[] lpcO3Buf;
 
 		input = inputStart;
 		const uint8_t* const outputStart = output;
@@ -1532,51 +1417,49 @@ namespace spectrum {
 		//Second pass: remove false positives for lpc filter
 		if (options.backendCompressor) {
 
-			size_t pos = 0;
 			for (size_t i = 0; i < filters.size(); i++) {
 
 				switch (filters[i].filter) {
 				case LPC_FILTER:
 				{
-					int order = filters[i].order;
-					uint8_t* testStart = pos < options.contextSize ? output : output + pos - options.contextSize;
-					uint8_t* testEnd = size - pos - filters[i].size < options.contextSize ? output + size : output + pos + filters[i].size + options.contextSize;
-					size_t testSize = testEnd - testStart;
-
-					size_t originalSize = (*options.backendCompressor)(testStart, testSize);
+					lpc_encode(input + filters[i].position, filters[i].size, output, filters[i].order, filters[i].channels, filters[i].channelWidth, filters[i].offset);
+					size_t originalSize = (*options.backendCompressor)(output, filters[i].size);
 					//Try reducing order of lpc by 1, or disabling the filter if it was already 1
-					if (order == 1)
-						memcpy(output + pos, input + pos, filters[i].size);
+					if (filters[i].order == 1)
+						memcpy(output, input + filters[i].position, filters[i].size);
 					else
-						lpc_encode(input + pos, filters[i].size, output + pos, filters[i].order - 1, filters[i].channels, filters[i].channelWidth, filters[i].offset);
-					size_t replaceSize = (*options.backendCompressor)(testStart, testSize);
+						lpc_encode(input + filters[i].position, filters[i].size, output, filters[i].order - 1, filters[i].channels, filters[i].channelWidth, filters[i].offset);
+					size_t replaceSize = (*options.backendCompressor)(output, filters[i].size);
 
 					//Change the filter if the result was better
 					if (replaceSize < originalSize) {
-						if (order == 1)
+						if (filters[i].order == 1)
 							filters[i].filter = NONE_FILTER;
 						else
 							filters[i].order -= 1;
 					}
-					//Restore state
-					else
-						lpc_encode(input + pos, filters[i].size, output + pos, filters[i].order, filters[i].channels, filters[i].channelWidth, filters[i].offset);
 					break;
 				}
 				default:
 					break;
 				}
-				pos += filters[i].size;
+
+				//Current filter is now equal to previous, remove it
+				if (i > 0 && filters[i - 1].operator==(filters[i])) {
+					filters[i - 1].size += filters[i].size;
+					filters.erase(filters.begin() + i);
+					i -= 1;
+				}
 			}
 		}
 
 		for (auto filter = filters.begin() + 1; filter != filters.end(); filter++) {
 
-			//printf("\n Filter %d, size %d, order %d, channels %d, width %d, offset %d", 
-			//	filter->filter, filter->size, filter->order, filter->channels, filter->channelWidth, filter->offset);
+			//printf("\n Filter %d, pos %d, size %d, order %d, channels %d, width %d, offset %d", 
+			//	filter->filter, filter->position, filter->size, filter->order, filter->channels, filter->channelWidth, filter->offset);
 
 			*output++ = filter->filter;
-			write_LEB128(output, filter->size);
+			write_LEB128(output, filter->size - 1);
 			if (filter->filter == LPC_FILTER) {
 				uint8_t metadata = 0;
 				metadata |= (filter->order - 1) << 6;
@@ -1588,7 +1471,6 @@ namespace spectrum {
 		}
 
 		for (auto filter = filters.begin() + 1; filter != filters.end(); filter++) {
-
 			size_t processedSize;
 			if (filter->filter == X86_FILTER)
 				processedSize = x86_encode(input, filter->size, output);
@@ -1603,6 +1485,7 @@ namespace spectrum {
 				return -1;
 			output += processedSize;
 			input += filter->size;
+			delete[] filter->extraData;
 		}
 
 		return output - outputStart;
@@ -1623,14 +1506,15 @@ namespace spectrum {
 
 		std::vector<PreprocessorBlock> filters;
 		try {
-			size_t detectedSize = 0;  //total bytes stored by currently read filters
-			while (detectedSize < decodedSize) {
+			size_t readSize = 0;  //total bytes stored by currently read filters
+			while (readSize < decodedSize) {
 				size_t filter, blockSize;
 				int order, channels, channelWidth, offset;
 				if (read_LEB128(encoded, encodedEnd, &filter))
 					return -1;
 				if (read_LEB128(encoded, encodedEnd, &blockSize))
 					return -1;
+				blockSize += 1;
 				if (filter == LPC_FILTER) {
 					if (encoded == encodedEnd)
 						return -1;
@@ -1640,11 +1524,11 @@ namespace spectrum {
 					offset = (*encoded >> 0 & 0x1);
 					encoded++;
 				}
-				filters.push_back({ filter, blockSize, order, channels, channelWidth, offset });
+				filters.push_back({ filter, readSize, blockSize, order, channels, channelWidth, offset });
 
-				if (decodedSize - detectedSize < blockSize)
+				if (decodedSize - readSize < blockSize)
 					return -1;
-				detectedSize += blockSize;
+				readSize += blockSize;
 			}
 		}
 		catch (std::bad_alloc& e) {

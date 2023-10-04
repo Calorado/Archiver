@@ -1,5 +1,5 @@
 /*
- * Simple Archiver v0.2
+ * Simple Archiver v0.3
  * Copyright (c) 2022 Carlos de Diego
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -21,11 +21,12 @@ namespace archiver {
 	const int ERROR_BAD_FILE = -1;
 	const int ERROR_UNKNOWN_CODEC = -2;
 	const int ERROR_OUT_OF_MEMORY = -3;
-	const int ERROR_FILE_OPEN_FAILED = -4;
-	const int ERROR_BAD_CHECKSUM = -5;
-	const int ERROR_INVALID_ARGUMENT = -6;
-	const int ERROR_WRONG_PASSWORD = -7;
-	const int ERROR_OTHER = -8;
+	const int ERROR_INPUT_FILE_OPEN_FAIL = -4;
+	const int ERROR_OUTPUT_FILE_OPEN_FAIL = -5;
+	const int ERROR_BAD_CHECKSUM = -6;
+	const int ERROR_INVALID_ARGUMENT = -7;
+	const int ERROR_WRONG_PASSWORD = -8;
+	const int ERROR_OTHER = -9;
 
 	//Base class that allows to track progress of creation and extraction of an archive.
 	//You will have to create a child class which implements the functions.
@@ -51,7 +52,7 @@ namespace archiver {
 		int compressionLevel = 0;
 		std::string password;
 		//How much memory will the deduplicator use. 0 is disabled,
-		// otherwise about 64*32*2^N bytes
+		// otherwise about 64*16*2^N bytes
 		size_t deduplicationMemoryLog = 0;
 		bool useSolidBlock = false;
 		size_t maxBlockSize = 1048576;
@@ -73,6 +74,7 @@ namespace archiver {
 
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <cstdint>
 #include <time.h>
 #include <chrono>
@@ -96,8 +98,9 @@ namespace archiver {
 
 //Why microsoft
 #if defined(_MSC_VER)
-#undef __cplusplus
-#define __cplusplus _MSVC_LANG
+#define CPP_VER _MSVC_LANG
+#else
+#define CPP_VER __cplusplus
 #endif
 
 namespace archiver {
@@ -105,7 +108,6 @@ namespace archiver {
 	const int END_BLOCK_ID = 0;
 	const int FILE_TREE_BLOCK_ID = 1;
 	const int DATA_BLOCK_ID = 2;
-	const int DEDUPLICATION_BLOCK_ID = 3;
 
 	const uint8_t FILE_SIGNATURE[4] = { 'S', 'a', 'r', 'c' };
 
@@ -260,11 +262,24 @@ namespace archiver {
 		ArchiveCallbackInternal(ArchiveCallback* c) {
 			userCallbacks = c;
 		}
-		void init(size_t threads, size_t _containedSize, size_t _baseProgress) {
+		void init(size_t threads, size_t _containedSize) {
 			threadProgress = std::vector<size_t>(threads, 0);
 			threadCompressedSize = std::vector<size_t>(threads, 0);
 			containedSize = _containedSize;
-			baseProgress = _baseProgress;
+		}
+		void add_base_progress(size_t processedBytes) {
+			if (userCallbacks) {
+				threadMtx.lock();
+				baseProgress += processedBytes;
+				size_t totalProgress = baseProgress;
+				size_t totalCompressedSize = 0;
+				for (size_t i = 0; i < threadProgress.size(); i++) {
+					totalProgress += threadProgress[i];
+					totalCompressedSize += threadCompressedSize[i];
+				}
+				userCallbacks->progress(containedSize, totalProgress, totalCompressedSize);
+				threadMtx.unlock();
+			}
 		}
 		//The functions below will be called by multiple threads
 		void add_progress(size_t processedBytes, size_t compressedSize, size_t threadID) {
@@ -335,6 +350,10 @@ namespace archiver {
 		}
 		void set_progress_scale(double s) {
 			progressScale = s;
+		}
+		void add_base_progress(size_t p) {
+			totalProgress += p;
+			progress(0, 0); //Update progress bar
 		}
 		void end_block(size_t blockRawSize, size_t blockCompressedSize) {
 			progressScale = 1;
@@ -425,7 +444,7 @@ namespace archiver {
 		uint8_t* out = new (std::nothrow) uint8_t[strider::compress_bound(size)];
 		if (!out)
 			return 0;
-		size_t compressed = strider::compress(data, size, out, 5);
+		size_t compressed = strider::compress(data, size, out, 4);
 		delete[] out;
 		return compressed;
 	}
@@ -443,15 +462,22 @@ namespace archiver {
 
 			spectrum::EncoderOptions spectrumOptions;
 			if (parameters->codecNameList.size() > 1 && parameters->codecNameList[1] == "strider") {
-				if (parameters->compressionLevel >= 9)
-					spectrumOptions = { &spectrum_strider_optimal_backend, 16384, 32768, 256, 64, 0, true };
-				else if (parameters->compressionLevel >= 6)
-					spectrumOptions = { &spectrum_strider_fast_backend, 16384, 32768, 384, 128, 0, true };
-				else
-					spectrumOptions = { nullptr, 16384, 0, 768, 256, 96, false };
+				spectrum::EncoderOptions striderOptions[10] = {
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ nullptr, 16384, 1024, 256, 128, false },
+					{ &spectrum_strider_fast_backend, 16384, 384, 128, 0, true },
+					{ &spectrum_strider_fast_backend, 16384, 384, 128, 0, true },
+					{ &spectrum_strider_fast_backend, 16384, 384, 128, 0, true },
+					{ &spectrum_strider_optimal_backend, 16384, 384, 128, 0, true },
+				};
+				spectrumOptions = striderOptions[std::max(std::min(parameters->compressionLevel, 9), 0)];
 			}
 			else
-				spectrumOptions = { nullptr, 16384, 0, 512, 256, 0, false };
+				spectrumOptions = { nullptr, 16384, 512, 256, 0, false };
 
 			size_t encodedSize = spectrum::encode(input, inSize, output, spectrumOptions);
 			if (encodedSize == -1) {
@@ -740,17 +766,16 @@ namespace archiver {
 	//                                                    //
 	////////////////////////////////////////////////////////
 
-	struct DedupBlock {
-		size_t originalFile;
-		size_t originalOffset;
-		size_t copyOffset;
-		size_t length;
-	};
-	struct FileBlock {
-		size_t fileIndex = -1;
-		size_t offset = -1;
-		size_t length = -1;
-		uint64_t hash = -1;
+	struct DedupChunk {
+		size_t originalPos;
+		size_t copyPos;
+		int length;
+		union {
+			//For compressor
+			bool isLastChunkOfBlock; 
+			//For decompressor: whether this chunk has already been copied
+			bool copied;  
+		};
 	};
 
 	struct ArchiveEntry {
@@ -759,29 +784,7 @@ namespace archiver {
 		size_t size;  //Contained size for directories
 		uint16_t permissions;
 		time_t modifyTime;
-
-		//Stuff for deduplication
-		std::vector<DedupBlock> dedupBlocks;
-		size_t nextDedupBlock = 0;
-
-		//Position of next deduplicated block or end of file
-		size_t get_next_file_cut() {
-			if (nextDedupBlock == dedupBlocks.size())
-				return size;
-			return dedupBlocks[nextDedupBlock].copyOffset;
-		}
-		void add_dedup_block(size_t originalFile, size_t originalOffset, size_t copyOffset, size_t length) {
-			//If this is a continuation of the last found duplicate add its length to that duplicate, this saves header space
-			if (!dedupBlocks.empty() &&
-				dedupBlocks.back().originalFile == originalFile &&
-				dedupBlocks.back().originalOffset + dedupBlocks.back().length == originalOffset &&
-				dedupBlocks.back().copyOffset + dedupBlocks.back().length == copyOffset)
-			{
-				dedupBlocks.back().length += length;
-			}
-			else
-				dedupBlocks.push_back({ originalFile, originalOffset, copyOffset, length });
-		}
+		uint64_t globalPos = 0;  //If we concatenate all files, this is the byte this one would start at
 
 		std::string get_filename() {
 			return std::filesystem::path(absolutePath).filename().string();
@@ -805,8 +808,25 @@ namespace archiver {
 		}
 	};
 
-	const size_t MIN_CHUNK_SIZE = 2048;
-	const size_t MAX_CHUNK_SIZE = 65536;
+	void find_file_and_offset_from_global_pos(std::vector<ArchiveEntry>* entryList, size_t pos, size_t* fileIndex, size_t* fileOffset) {
+
+		size_t low = 0;
+		size_t high = entryList->size();
+
+		while (high - low > 1) {
+			size_t mid = (high + low) / 2;
+			if (entryList->at(mid).globalPos > pos)
+				high = mid;
+			else
+				low = mid;
+		}
+
+		*fileIndex = low;
+		*fileOffset = pos - entryList->at(low).globalPos;
+	}
+
+	const size_t AVERAGE_CHUNK_SIZE = 4096;
+	const size_t MAX_CHUNK_SIZE = 32767;
 	const size_t ROLLING_HASH_SIZE = 32;
 
 	//Precomputed byte to random integer for the rolling hash
@@ -847,89 +867,83 @@ namespace archiver {
 
 	size_t get_chunk_size(uint8_t* data, size_t dataSize) {
 		//Not much data left, the chunk will extend to file end
-		if (dataSize < MIN_CHUNK_SIZE)
+		if (dataSize < AVERAGE_CHUNK_SIZE / 2)
 			return dataSize;
 		else {
-			size_t pos = MIN_CHUNK_SIZE;
+			size_t pos = AVERAGE_CHUNK_SIZE / 2;
 			uint32_t rollingHash = 0;
 			for (size_t i = 0; i < ROLLING_HASH_SIZE; i++)
 				rollingHash = (rollingHash >> 1) ^ BYTE_HASHES[data[pos - ROLLING_HASH_SIZE + i]];
 
 			for (; pos < dataSize; pos++) {
 				rollingHash = (rollingHash >> 1) ^ BYTE_HASHES[data[pos]];
-				if (rollingHash % MIN_CHUNK_SIZE == 0)
+				if (rollingHash % (AVERAGE_CHUNK_SIZE / 2) == 0)
 					break;
 			}
 			return pos;
 		}
 	}
 
-	size_t compare_blocks(uint8_t* dataA, size_t chunkASize, const std::string& pathB, size_t posB) {
-
-		std::fstream fileB(pathB, std::fstream::binary | std::fstream::in);
-		size_t fileBToEnd = std::filesystem::file_size(pathB) - posB;
-		fileB.seekg(posB);
-
-		uint8_t* dataB = new (std::nothrow) uint8_t[MAX_CHUNK_SIZE];
-		if (!dataB) 
-			return ERROR_OUT_OF_MEMORY;
-
-		size_t readBBytes = std::min(chunkASize, fileBToEnd);
-		fileB.read((char*)dataB, readBBytes);
-
-		//To avoid duplicates pointing to another duplicate we just have limit
-		// the comparison to the end of both chunks.
-		//Now here is the magic part: we only need to know the size of one of the chunks.
-		//If both have the same size, then there is no problem, the comparison will stop 
-		// at the end of both. But if one is smaller than the other, that means that at the 
-		// of the smaller chunk the rolling hashes diferred, which means at least one byte
-		// is different, which again means the comparison will stop sooner!
-
-		size_t maxCompare = std::min(chunkASize, readBBytes);
-		size_t length = std::mismatch(dataA, dataA + maxCompare, dataB).first - dataA;
-		delete[] dataB;
-		return length;
-	}
+	#pragma pack(push, 2)
+	struct DeduperDictEntry {
+		uint64_t pos = 0;
+		uint64_t hash = 0;
+		uint16_t otherData = 0;
+		DeduperDictEntry() {}
+		DeduperDictEntry(uint64_t pos, uint64_t hash, uint16_t length, bool lastChunkOfBlock) {
+			this->pos = pos;
+			this->hash = hash;
+			this->otherData = length | (lastChunkOfBlock << 15);
+		}
+		uint16_t length() {
+			return otherData & 0x7FFF;
+		}
+		bool is_last_chunk_of_block() {
+			return otherData >> 15;
+		}
+	};
+	#pragma pack(pop)
 
 	class DeduperDictionary {
 	public:
 		//A very high load factor allows us to more tightly pack all the hashes in memory, at the cost
 		// of speed. This is however not an issue, since the bottleneck will still be disk reads.
 		const size_t BUCKET_LOAD = 64;
-		FileBlock* hashTable = nullptr;
+		DeduperDictEntry* hashTable = nullptr;
 		size_t* bucketLoads = nullptr;
 		size_t tableMask = 0;
-		std::mutex mtx;
+		std::shared_mutex mtx;
 
-		DeduperDictionary(size_t bucketsLog) {
-			tableMask = (1 << bucketsLog) - 1;
-			hashTable = new FileBlock[BUCKET_LOAD << bucketsLog];
-			bucketLoads = new size_t[1 << bucketsLog]();
-		}
+		DeduperDictionary() {}
 		~DeduperDictionary() {
 			delete[] hashTable;
 			delete[] bucketLoads;
 		}
-		//Returns nullptr if not found
-		FileBlock* at(uint64_t hash) {
-			mtx.lock();
+		void init(size_t bucketsLog) {
+			tableMask = (1 << bucketsLog) - 1;
+			hashTable = new DeduperDictEntry[BUCKET_LOAD << bucketsLog];
+			bucketLoads = new size_t[1 << bucketsLog]();
+		}
+		//Returns length of 0 if not found
+		DeduperDictEntry at(uint64_t hash) {
+			mtx.lock_shared();
 			size_t maxPos = bucketLoads[hash & tableMask];
 			size_t pos = maxPos < BUCKET_LOAD ? 0 : maxPos - BUCKET_LOAD;
-			FileBlock* result = nullptr;
-			FileBlock* bucket = &hashTable[(hash & tableMask) * BUCKET_LOAD];
+			DeduperDictEntry result(0, 0, 0, 0);
+			DeduperDictEntry* bucket = &hashTable[(hash & tableMask) * BUCKET_LOAD];
 			for (; pos < maxPos; pos++) {
 				if (bucket[pos % BUCKET_LOAD].hash == hash) {
-					result = &bucket[pos % BUCKET_LOAD];
+					result = bucket[pos % BUCKET_LOAD];
 					break;
 				}
 			}
-			mtx.unlock();
+			mtx.unlock_shared();
 			return result;
 		}
 		//Adds the new element to the table
-		void emplace(FileBlock block) {
+		void emplace(DeduperDictEntry block) {
 			mtx.lock();
-			FileBlock* bucket = &hashTable[(block.hash & tableMask) * BUCKET_LOAD];
+			DeduperDictEntry* bucket = &hashTable[(block.hash & tableMask) * BUCKET_LOAD];
 			size_t load = bucketLoads[block.hash & tableMask];
 			bucket[load % BUCKET_LOAD] = block;
 			bucketLoads[block.hash & tableMask]++;
@@ -937,122 +951,22 @@ namespace archiver {
 		}
 	};
 
-	void dedup_file(std::vector<ArchiveEntry>* entryList, size_t thisEntryIndex, DeduperDictionary* blockHashes) {
-
-		size_t MEMORY_BLOCK_SIZE = MAX_CHUNK_SIZE * 16;
-		ArchiveEntry* thisEntry = &entryList->at(thisEntryIndex);
-		//Very small file, dont bother
-		if (thisEntry->size < ROLLING_HASH_SIZE)
-			return;
-		std::fstream in(thisEntry->absolutePath, std::fstream::in | std::fstream::binary);
-		if (!in.is_open())
-			return;
-		uint8_t* data = new (std::nothrow) uint8_t[MEMORY_BLOCK_SIZE];
-		if (!data)
-			return;
-
-		size_t filePos = 0;
-		size_t lowBufferPos = 0;
-		size_t highBufferPos = std::min(thisEntry->size, MEMORY_BLOCK_SIZE);
-		in.read((char*)data, highBufferPos);
-
-		while (filePos < thisEntry->size) {
-
-			size_t bytesLeft = thisEntry->size - filePos;
-			//Too small block, dont bother
-			if (bytesLeft < ROLLING_HASH_SIZE)
-				break;
-			//Need more data from disk
-			size_t remainingInBuffer = highBufferPos - filePos;
-			if (remainingInBuffer < MAX_CHUNK_SIZE && highBufferPos != thisEntry->size) {
-				size_t readFromBuffer = filePos - lowBufferPos;
-				memmove(data, data + readFromBuffer, remainingInBuffer);
-				in.read((char*)data + remainingInBuffer, readFromBuffer);
-				lowBufferPos += readFromBuffer;
-				highBufferPos += readFromBuffer;
-			}
-			
-			uint8_t* const chunkBegin = data + filePos - lowBufferPos;
-			uint64_t hash = XXH3_64bits(chunkBegin, std::min(bytesLeft, MIN_CHUNK_SIZE));
-			size_t chunkSize = get_chunk_size(chunkBegin, std::min(bytesLeft, MAX_CHUNK_SIZE));
-
-			FileBlock* otherBlock = blockHashes->at(hash);
-			if (otherBlock != nullptr) {
-				size_t dedupLength = compare_blocks(chunkBegin, chunkSize, entryList->at(otherBlock->fileIndex).absolutePath, otherBlock->offset);
-				if (dedupLength >= ROLLING_HASH_SIZE)
-					thisEntry->add_dedup_block(otherBlock->fileIndex, otherBlock->offset, filePos, dedupLength);
-			}
-			else
-				blockHashes->emplace({ thisEntryIndex, filePos, chunkSize, hash });
-			filePos += chunkSize;
-		}
-
-		delete[] data;
-	}
-
-	void dedup_thread(std::vector<ArchiveEntry>* entryList, size_t* iterator, DeduperDictionary* blockHashes, std::mutex* mtx) {
-
-		while (true) {
-			mtx->lock();
-			if (*iterator == entryList->size()) {
-				mtx->unlock();
-				return;
-			}
-			size_t thisEntryIndex = *iterator;
-			*iterator += 1;
-			mtx->unlock();
-
-			if (entryList->at(thisEntryIndex).size == 0 || entryList->at(thisEntryIndex).type != 'f')
-				continue;
-			dedup_file(entryList, thisEntryIndex, blockHashes);
-		}
-	}
-
-	int deduplicator(std::vector<ArchiveEntry>* entryList, const Parameters& parameters) {
-
-		//Find duplicate files
-		std::mutex mtx;
-		std::thread* cpu = new std::thread[parameters.threads];
-		DeduperDictionary blockHashes(parameters.deduplicationMemoryLog);
-		size_t dedupIterator = 0;
-
-		for (int i = 0; i < parameters.threads; i++)
-			cpu[i] = std::thread(dedup_thread, entryList, &dedupIterator, &blockHashes, &mtx);
-		for (int i = 0; i < parameters.threads; i++)
-			cpu[i].join();
-
-		/*size_t dedup = 0;
-		for (size_t i = 0; i < entryList->size(); i++) {
-			for (size_t j = 0; j < entryList->at(i).dedupBlocks.size(); j++) {
-				size_t x1 = entryList->at(i).dedupBlocks[j].originalOffset;
-				size_t x2 = entryList->at(i).dedupBlocks[j].originalOffset + entryList->at(i).dedupBlocks[j].length;
-				ArchiveEntry& o = entryList->at(entryList->at(i).dedupBlocks[j].originalFile);
-				dedup += entryList->at(i).dedupBlocks[j].length;
-				for (size_t k = 0; k < o.dedupBlocks.size(); k++) {
-					if ((o.dedupBlocks[k].copyOffset >= x1 && o.dedupBlocks[k].copyOffset < x2) ||
-						(o.dedupBlocks[k].copyOffset + o.dedupBlocks[k].length - 1 >= x1 && o.dedupBlocks[k].copyOffset + o.dedupBlocks[k].length - 1 < x2))
-						cout << "\n dedup superposition " << x1 << " " << x2 << " " << o.dedupBlocks[k].copyOffset << " " << o.dedupBlocks[k].copyOffset + o.dedupBlocks[k].length - 1;
-				}
-			}
-		}
-		cout << "\n Dedup " << dedup;*/
-
-		return NO_ERROR;
-	}
-
 	struct PackedBlock {
 		uint8_t* data = nullptr;
-		std::vector<size_t> sizes;
+		//Output sizes of each codec. The first element is the raw size minus deduplicated chunks
+		std::vector<size_t> outputSizes; 
 		int type = 0;
-		//The number of this block for this specific block type (except end blocks)
-		size_t index = 0;
+		//Position of data block in global space
+		size_t globalPos = 0;
+		//For data blocks
+		std::vector<DedupChunk> dedupChunks;
 	};
 
 	void pack_block(PackedBlock* packedBlock, std::vector<Codec*>* codecList, const Parameters& parameters, ThreadCallback* callbacks)
 	{
 		for (auto codec : *codecList) {
 
-			uint8_t* output = new (std::nothrow) uint8_t[codec->encode_bound(packedBlock->sizes.back())];
+			uint8_t* output = new (std::nothrow) uint8_t[codec->encode_bound(packedBlock->outputSizes.back())];
 			if (!output) {
 				callbacks->set_error(ERROR_OUT_OF_MEMORY);
 				delete[] packedBlock->data;
@@ -1060,117 +974,271 @@ namespace archiver {
 				return;
 			}
 
-			size_t encodedSize = codec->encode(packedBlock->data, packedBlock->sizes.back(), output, &parameters, callbacks);
-			packedBlock->sizes.push_back(encodedSize);
+			size_t encodedSize = codec->encode(packedBlock->data, packedBlock->outputSizes.back(), output, &parameters, callbacks);
+			packedBlock->outputSizes.push_back(encodedSize);
 			delete[] packedBlock->data;
 			packedBlock->data = nullptr;
 
 			if (callbacks->abort())
 				return;
 			packedBlock->data = output;
-			callbacks->set_progress_scale((double)packedBlock->sizes.front() / packedBlock->sizes.back());
+			callbacks->set_progress_scale((double)packedBlock->outputSizes.front() / std::max(packedBlock->outputSizes.back(), (size_t)1));
 		}
-		callbacks->end_block(packedBlock->sizes.front(), packedBlock->sizes.back());
+		callbacks->end_block(packedBlock->outputSizes.front(), packedBlock->outputSizes.back());
 	}
 
 	void write_block(std::fstream* outFile, PackedBlock* packedBlock) {
 
-		std::vector<uint8_t> blockHeader(2, 0);
-		blockHeader.push_back(packedBlock->type);
 		if (packedBlock->type == END_BLOCK_ID) {
-			write_uint16le(blockHeader.data(), blockHeader.size() - 2);
+			std::vector<uint8_t> blockHeader;
+			blockHeader.push_back(1);
+			blockHeader.push_back(packedBlock->type);
 			uint16_t checksum = CRC::Calculate(blockHeader.data(), blockHeader.size(), CRC::CRC_16_X25());
 			write_uint16le(outFile, checksum);
 			outFile->write((char*)blockHeader.data(), blockHeader.size());
 			return;
 		}
 
-		write_LEB128_vector(&blockHeader, packedBlock->index);
-		for (auto size : packedBlock->sizes)
-			write_LEB128_vector(&blockHeader, size);
-		write_uint16le(blockHeader.data(), blockHeader.size() - 2);
+		std::vector<uint8_t> blockHeader(10, 0);
+		//Block type
+		blockHeader.push_back(packedBlock->type);
+		//Sizes of all codecs
+		for (int i = 0; i < packedBlock->outputSizes.size(); i++) 
+			write_LEB128_vector(&blockHeader, packedBlock->outputSizes[i]);
+		if (packedBlock->type == DATA_BLOCK_ID) {
+			//Block pos
+			write_LEB128_vector(&blockHeader, packedBlock->globalPos);
+			//Dedup info
+			size_t lastCopyEnd = 0;
+			for (int i = 0; i < packedBlock->dedupChunks.size(); i++) {
+				write_LEB128_vector(&blockHeader, packedBlock->dedupChunks[i].length);
+				size_t copyPosDelta = packedBlock->dedupChunks[i].copyPos - lastCopyEnd;
+				write_LEB128_vector(&blockHeader, copyPosDelta);
+				write_LEB128_vector(&blockHeader, packedBlock->dedupChunks[i].originalPos);
+				lastCopyEnd = packedBlock->dedupChunks[i].copyPos + packedBlock->dedupChunks[i].length;
+			}
+			//Signal no more deduplication with a length 0
+			blockHeader.push_back(0);
+		}
+
+		//Write header length
+		uint8_t* headerSizePtr = blockHeader.data();
+		write_LEB128_ptr(headerSizePtr, blockHeader.size() - 10);
+		blockHeader.erase(blockHeader.begin() + (headerSizePtr - blockHeader.data()), blockHeader.begin() + 10);
+
 		uint16_t headerChecksum = CRC::Calculate(blockHeader.data(), blockHeader.size(), CRC::CRC_16_X25());
 		write_uint16le(outFile, headerChecksum);
 		outFile->write((char*)blockHeader.data(), blockHeader.size());
 
-		uint32_t dataChecksum = CRC::Calculate(packedBlock->data, packedBlock->sizes.back(), CRC::CRC_32());
+		uint32_t dataChecksum = CRC::Calculate(packedBlock->data, packedBlock->outputSizes.back(), CRC::CRC_32());
 		write_uint32le(outFile, dataChecksum);
-		outFile->write((char*)packedBlock->data, packedBlock->sizes.back());
+		outFile->write((char*)packedBlock->data, packedBlock->outputSizes.back());
 	}
 
 	void data_block_thread(std::fstream* outFile, std::vector<Codec*>* codecList, const Parameters& parameters,
-		std::vector<ArchiveEntry>* entryList, size_t* readFiles, size_t* filePos, size_t* createdBlocks,
-		std::mutex* diskReadMtx, std::mutex* diskWriteMtx, ThreadCallback* progress) 
+		std::vector<ArchiveEntry>* entryList, size_t* globalReadBytes, const size_t totalBytes,
+		std::mutex* diskReadMtx, std::mutex* diskWriteMtx, ThreadCallback* progress, DeduperDictionary* blockHashes)
 	{
+		size_t lastOpenedFile = -1;
+		std::fstream otherFileStream;
+		uint8_t* otherFileData = new uint8_t[MAX_CHUNK_SIZE];
+
 		while (true) {
 			size_t thisBlockSize = 0;
 			uint8_t* inputBuffer = new (std::nothrow) uint8_t[parameters.maxBlockSize];
-			std::fstream inFile;
 			if (!inputBuffer) {
 				progress->set_error(ERROR_OUT_OF_MEMORY);
+				delete[] otherFileData;
 				return;
 			}
 
 			diskReadMtx->lock();
 
-			PackedBlock packedBlock;
-			packedBlock.index = *createdBlocks;
-			packedBlock.data = inputBuffer;
-			packedBlock.type = DATA_BLOCK_ID;
+			if (*globalReadBytes == totalBytes) {
+				diskReadMtx->unlock();
+				delete[] inputBuffer;
+				delete[] otherFileData;
+				return;
+			}
 
-			while (thisBlockSize < (parameters.useSolidBlock ? parameters.maxBlockSize : 1) && *readFiles != entryList->size()) {
+			size_t globalBlockPos = *globalReadBytes;
+			size_t fileIndex, fileOffset;
+			find_file_and_offset_from_global_pos(entryList, globalBlockPos, &fileIndex, &fileOffset);
+
+			if (parameters.useSolidBlock) 
+				thisBlockSize = std::min(totalBytes - globalBlockPos, parameters.maxBlockSize);
+			else {
+				//Skip zero length files and non files
+				while (entryList->at(fileIndex).size == 0 || entryList->at(fileIndex).type != 'f') { fileIndex++; }
+				thisBlockSize = std::min(entryList->at(fileIndex).size - fileOffset, parameters.maxBlockSize);
+			}
+			*globalReadBytes += thisBlockSize;
+
+			PackedBlock packedBlock;
+			packedBlock.data = inputBuffer;
+			packedBlock.outputSizes.push_back(thisBlockSize);
+			packedBlock.type = DATA_BLOCK_ID;
+			packedBlock.globalPos = globalBlockPos;
+
+			diskReadMtx->unlock();
+
+			if (thisBlockSize == 0) {
+				delete[] inputBuffer;
+				delete[] otherFileData;
+				return;
+			}
+
+			size_t readBytes = 0;
+			std::fstream inFile;
+
+			while (readBytes < thisBlockSize) {
 
 				//Last file was finished, open the next one
 				if (!inFile.is_open()) {
-					if (entryList->at(*readFiles).type != 'f') {
-						(*readFiles)++;
+					if (entryList->at(fileIndex).type != 'f' || entryList->at(fileIndex).size == 0) {
+						fileIndex++;
 						continue;
 					}
-					inFile.open(entryList->at(*readFiles).absolutePath, std::fstream::in | std::fstream::binary);
+					inFile.open(entryList->at(fileIndex).absolutePath, std::fstream::in | std::fstream::binary);
 					if (!inFile.is_open()) {
-						progress->set_error(ERROR_FILE_OPEN_FAILED);
+						progress->set_error(ERROR_INPUT_FILE_OPEN_FAIL);
 						delete[] inputBuffer;
-						diskReadMtx->unlock();
+						delete[] otherFileData;
 						return;
 					}
-					inFile.seekg(*filePos);
+					inFile.seekg(fileOffset);
 				}
 
-				//Position of the file where we stop reading, because of end of file or a deduped block
-				size_t nextFileCut = entryList->at(*readFiles).get_next_file_cut();
-				size_t bytesToRead = std::min(parameters.maxBlockSize - thisBlockSize, nextFileCut - inFile.tellg());
-				inFile.read((char*)inputBuffer + thisBlockSize, bytesToRead);
-				thisBlockSize += bytesToRead;
+				size_t bytesToRead = std::min(thisBlockSize - readBytes, entryList->at(fileIndex).size - fileOffset);
+				inFile.read((char*)inputBuffer + readBytes, bytesToRead);
+				readBytes += bytesToRead;
 
-				if (inFile.tellg() == nextFileCut && inFile.tellg() != entryList->at(*readFiles).size) {
-					inFile.seekg(entryList->at(*readFiles).dedupBlocks[entryList->at(*readFiles).nextDedupBlock].length, std::fstream::cur);
-					entryList->at(*readFiles).nextDedupBlock++;
-				}
-				*filePos = inFile.tellg();
-
-				if (entryList->at(*readFiles).size == inFile.tellg()) {
+				if (entryList->at(fileIndex).size == inFile.tellg()) {
 					inFile.close();
-					(*readFiles)++;
-					*filePos = 0;
+					fileIndex++;
+					fileOffset = 0;
 				}
 			}
-			inFile.close();
-			packedBlock.sizes.push_back(thisBlockSize);
-			(*createdBlocks)++;
 
-			diskReadMtx->unlock();
+			inFile.close();
 			
 			//This can happen when the last files have size 0 or we have read all files
 			if (thisBlockSize == 0) {
 				delete[] inputBuffer;
+				delete[] otherFileData;
 				return;
+			}
+
+			if (blockHashes != nullptr) {
+
+				size_t totalDedup = 0;
+				size_t blockPos = 0;
+
+				while (blockPos < thisBlockSize) {
+					
+					size_t fileIndex, fileOffset;
+					find_file_and_offset_from_global_pos(entryList, globalBlockPos + blockPos, &fileIndex, &fileOffset);
+
+					size_t bytesToEndOfBlock = thisBlockSize - blockPos;
+					size_t bytesToEndOfFile = entryList->at(fileIndex).globalPos + entryList->at(fileIndex).size - (globalBlockPos + blockPos);
+					size_t maxChunkSize = std::min(bytesToEndOfBlock, bytesToEndOfFile);
+
+					//Skip very small chunks
+					if (maxChunkSize < 512) {
+						blockPos += maxChunkSize;
+						continue;
+					}
+
+					uint8_t* const chunkBegin = inputBuffer + blockPos;
+					uint64_t hash = XXH3_64bits(chunkBegin, std::min(maxChunkSize, AVERAGE_CHUNK_SIZE / 2));
+					size_t chunkSize = get_chunk_size(chunkBegin, std::min(maxChunkSize, MAX_CHUNK_SIZE));
+
+					DeduperDictEntry otherBlock = blockHashes->at(hash);
+					if (otherBlock.length() != 0) {
+						size_t otherFileIndex, otherFileOffset;
+						find_file_and_offset_from_global_pos(entryList, otherBlock.pos, &otherFileIndex, &otherFileOffset);
+						size_t maxCompare = std::min(chunkSize, (size_t)otherBlock.length());
+
+						uint8_t* dedupBuffer;
+						//Possible dedup is in current memory block
+						if (otherBlock.pos >= globalBlockPos && otherBlock.pos < globalBlockPos + thisBlockSize)
+							dedupBuffer = inputBuffer + otherBlock.pos - globalBlockPos;
+						else {
+							if (lastOpenedFile != otherFileIndex) {
+								otherFileStream.close();
+								otherFileStream.open(entryList->at(otherFileIndex).absolutePath, std::fstream::in | std::fstream::binary);
+								lastOpenedFile = otherFileIndex;
+							}
+
+							otherFileStream.seekg(otherFileOffset);
+							otherFileStream.read((char*)otherFileData, maxCompare);
+							dedupBuffer = otherFileData;
+						}
+
+						size_t dedupLength = std::mismatch(chunkBegin, chunkBegin + maxCompare, dedupBuffer).first - chunkBegin;
+
+						if (dedupLength >= ROLLING_HASH_SIZE) {
+
+							DedupChunk newDedup;
+							newDedup.copyPos = blockPos;
+							newDedup.length = dedupLength;
+							newDedup.originalPos = otherBlock.pos; 
+							newDedup.isLastChunkOfBlock = otherBlock.is_last_chunk_of_block();
+
+							if (packedBlock.dedupChunks.size() > 0) {
+
+								//Check if this deduped chunk is a continuation of the last deduped chunk, 
+								// and does not cross any file or block boundaries.
+								size_t lastCopyIndex, lastCopyOffset;
+								find_file_and_offset_from_global_pos(entryList, packedBlock.dedupChunks.back().copyPos + packedBlock.globalPos, &lastCopyIndex, &lastCopyOffset);
+								size_t lastOriginalIndex, lastOriginalOffset;
+								find_file_and_offset_from_global_pos(entryList, packedBlock.dedupChunks.back().originalPos, &lastOriginalIndex, &lastOriginalOffset);
+
+								//If the last deduped chunk references the last chunk of another block, and
+								// this would be a continuation of that it means it would cross a block boundary.
+								if (!packedBlock.dedupChunks.back().isLastChunkOfBlock &&
+									lastCopyIndex == fileIndex && lastOriginalIndex == otherFileIndex &&
+									packedBlock.dedupChunks.back().copyPos + packedBlock.dedupChunks.back().length == blockPos &&
+									packedBlock.dedupChunks.back().originalPos + packedBlock.dedupChunks.back().length == otherBlock.pos)
+								{
+									packedBlock.dedupChunks.back().length += dedupLength;
+									packedBlock.dedupChunks.back().isLastChunkOfBlock = otherBlock.is_last_chunk_of_block();
+								}
+								else
+									packedBlock.dedupChunks.push_back(newDedup);
+							}
+							else 
+								packedBlock.dedupChunks.push_back(newDedup);
+							
+							totalDedup += dedupLength;
+							progress->add_base_progress(dedupLength);
+						}
+					}
+					else {
+						bool isLastChunkOfBlock = blockPos + chunkSize == thisBlockSize;
+						blockHashes->emplace(DeduperDictEntry(globalBlockPos + blockPos, hash, chunkSize, isLastChunkOfBlock));
+					}
+					blockPos += chunkSize;
+				}
+
+				//Remove deduped chunks
+				if (packedBlock.dedupChunks.size() != 0) {
+					size_t pos = packedBlock.dedupChunks[0].copyPos;
+					for (int i = 0; i < packedBlock.dedupChunks.size(); i++) {
+						size_t nextDedup = i + 1 >= packedBlock.dedupChunks.size() ? thisBlockSize : packedBlock.dedupChunks[i + 1].copyPos;
+						size_t curDedupEnd = packedBlock.dedupChunks[i].copyPos + packedBlock.dedupChunks[i].length;
+						memmove(inputBuffer + pos, inputBuffer + curDedupEnd, nextDedup - curDedupEnd);
+						pos += nextDedup - curDedupEnd;
+					}
+				}
+				packedBlock.outputSizes.back() -= totalDedup;
 			}
 
 			pack_block(&packedBlock, codecList, parameters, progress);
 
 			//Error during encoding
 			if (progress->abort()) {
-				delete[] inputBuffer;
+				delete[] otherFileData;
 				return;
 			}
 
@@ -1185,20 +1253,22 @@ namespace archiver {
 	}
 
 	void write_data_blocks(std::fstream* outFile, std::vector<Codec*>* codecList, const Parameters& parameters,
-		std::vector<ArchiveEntry>* entryList, ArchiveCallbackInternal* callbacksInternal)
+		std::vector<ArchiveEntry>* entryList, size_t totalBytes, ArchiveCallbackInternal* callbacksInternal)
 	{
+		DeduperDictionary blockHashes;
+		if (parameters.deduplicationMemoryLog)
+			blockHashes.init(std::min(std::max((int)log2(totalBytes) - 18, 0), (int)parameters.deduplicationMemoryLog));
 		std::thread* cpu = new std::thread[parameters.threads];
 		ThreadCallback* progress = new ThreadCallback[parameters.threads];
 		for (int i = 0; i < parameters.threads; i++)
 			progress[i].init(i, callbacksInternal);
 		std::mutex diskReadMtx;
 		std::mutex diskWriteMtx;
-		size_t readFiles = 0;
-		size_t filePos = 0;
-		size_t createdBlocks = 0;
+		size_t globalReadBytes = 0;
 
 		for (int i = 0; i < parameters.threads; i++)
-			cpu[i] = std::thread(data_block_thread, outFile, codecList, parameters, entryList, &readFiles, &filePos, &createdBlocks, &diskReadMtx, &diskWriteMtx, &progress[i]);
+			cpu[i] = std::thread(data_block_thread, outFile, codecList, parameters, entryList, &globalReadBytes, totalBytes, 
+				&diskReadMtx, &diskWriteMtx, &progress[i], parameters.deduplicationMemoryLog ? &blockHashes : nullptr);
 		for (int i = 0; i < parameters.threads; i++) {
 			if (cpu[i].joinable())
 				cpu[i].join();
@@ -1208,10 +1278,9 @@ namespace archiver {
 		delete[] progress;
 	}
 
-	time_t get_modify_time(const std::string& path) {
-#if __cplusplus >= 202002L
-		const auto fileTime = std::filesystem::last_write_time(path);
-		const auto systemTime = std::chrono::clock_cast<std::chrono::system_clock>(fileTime);
+	time_t convert_modify_time(const std::filesystem::file_time_type& time) {
+#if CPP_VER >= 202002L
+		const auto systemTime = std::chrono::clock_cast<std::chrono::system_clock>(time);
 		return std::chrono::system_clock::to_time_t(systemTime);
 #else
 		//No portable way of doing this pre C++20, just return something
@@ -1219,8 +1288,7 @@ namespace archiver {
 #endif
 	}
 
-	uint16_t get_permissions(const std::string& path) {
-		std::filesystem::perms permissions = std::filesystem::status(path).permissions();
+	uint16_t convert_permissions(std::filesystem::perms permissions) {
 		return ((permissions & std::filesystem::perms::owner_read) != std::filesystem::perms::none) << 0 |
 			((permissions & std::filesystem::perms::owner_write) != std::filesystem::perms::none) << 1 |
 			((permissions & std::filesystem::perms::owner_exec) != std::filesystem::perms::none) << 2 |
@@ -1240,11 +1308,11 @@ namespace archiver {
 			if (entry.is_directory()) {
 				size_t subContainedSize = 0;
 				get_directory_entries(entryList, entryPath, &subContainedSize);
-				entryList->push_back({ 'd', entryPath, subContainedSize, get_permissions(entryPath), get_modify_time(entryPath) });
+				entryList->push_back({ 'd', entryPath, subContainedSize, convert_permissions(entry.status().permissions()), convert_modify_time(entry.last_write_time()) });
 				*containedSize += subContainedSize;
 			}
 			else if (entry.is_regular_file()) {
-				entryList->push_back({ 'f', entryPath, entry.file_size(), get_permissions(entryPath), get_modify_time(entryPath) });
+				entryList->push_back({ 'f', entryPath, entry.file_size(), convert_permissions(entry.status().permissions()), convert_modify_time(entry.last_write_time()) });
 				*containedSize += entry.file_size();
 			}
 		}
@@ -1269,11 +1337,13 @@ namespace archiver {
 
 					size_t containedSize;
 					get_directory_entries(entryList, inputElements[i], &containedSize);
-					entryList->push_back({ 'd', entryPath, containedSize, get_permissions(entryPath), get_modify_time(entryPath) });
+					entryList->push_back({ 'd', entryPath, containedSize, convert_permissions(std::filesystem::status(entryPath).permissions()),
+						convert_modify_time(std::filesystem::last_write_time(entryPath)) });
 				}
 				else {
 					size_t fileSize = std::filesystem::file_size(entryPath);
-					entryList->push_back({ 'f', entryPath, fileSize, get_permissions(entryPath), get_modify_time(entryPath) });
+					entryList->push_back({ 'f', entryPath, fileSize, convert_permissions(std::filesystem::status(entryPath).permissions()),
+						convert_modify_time(std::filesystem::last_write_time(entryPath)) });
 				}
 			}
 		}
@@ -1281,7 +1351,7 @@ namespace archiver {
 			return ERROR_OUT_OF_MEMORY;
 		}
 		catch (std::filesystem::filesystem_error& e) {
-			return ERROR_FILE_OPEN_FAILED;
+			return ERROR_INPUT_FILE_OPEN_FAIL;
 		}
 		return NO_ERROR;
 	}
@@ -1319,49 +1389,13 @@ namespace archiver {
 			return ERROR_OUT_OF_MEMORY;
 		}
 
+		PackedBlock packedHeader;
+		packedHeader.type = FILE_TREE_BLOCK_ID;
+		packedHeader.data = headerStreamPtr;
+		packedHeader.outputSizes.push_back(headerStream.size());
+		
 		ThreadCallback threadCallback;
 		threadCallback.init(0, nullptr);
-		PackedBlock packedHeader = { headerStreamPtr, { headerStream.size() }, FILE_TREE_BLOCK_ID, 0 };
-		pack_block(&packedHeader, codecList, parameters, &threadCallback);
-		if (threadCallback.get_error())
-			return threadCallback.get_error();
-		write_block(outFile, &packedHeader);
-		return NO_ERROR;
-	}
-
-	int write_deduplication_header(std::vector<ArchiveEntry>* entryList,
-		std::fstream* outFile, std::vector<Codec*>* codecList, const Parameters& parameters)
-	{
-		std::vector<uint8_t> headerStream;
-		uint8_t* headerStreamPtr = nullptr;
-		try {
-
-			for (size_t i = 0; i < entryList->size(); i++) {
-				if (entryList->at(i).dedupBlocks.empty())
-					continue;
-				write_LEB128_vector(&headerStream, i + 1);
-				write_LEB128_vector(&headerStream, entryList->at(i).dedupBlocks.size());
-				for (size_t j = 0; j < entryList->at(i).dedupBlocks.size(); j++) {
-					write_LEB128_vector(&headerStream, entryList->at(i).dedupBlocks[j].originalFile);
-					write_LEB128_vector(&headerStream, entryList->at(i).dedupBlocks[j].originalOffset);
-					write_LEB128_vector(&headerStream, entryList->at(i).dedupBlocks[j].copyOffset);
-					write_LEB128_vector(&headerStream, entryList->at(i).dedupBlocks[j].length);
-				}
-			}
-
-			//End mark
-			write_LEB128_vector(&headerStream, 0);
-
-			headerStreamPtr = new uint8_t[headerStream.size()];
-			memcpy(headerStreamPtr, headerStream.data(), headerStream.size());
-		}
-		catch (std::bad_alloc& e) {
-			return ERROR_OUT_OF_MEMORY;
-		}
-
-		ThreadCallback threadCallback;
-		threadCallback.init(0, nullptr);
-		PackedBlock packedHeader = { headerStreamPtr, { headerStream.size() }, DEDUPLICATION_BLOCK_ID, 0 };
 		pack_block(&packedHeader, codecList, parameters, &threadCallback);
 		if (threadCallback.get_error())
 			return threadCallback.get_error();
@@ -1405,7 +1439,7 @@ namespace archiver {
 		//Create the archive
 		std::fstream outFile(archivePath, std::fstream::binary | std::fstream::out);
 		if (!outFile.is_open())
-			return ERROR_FILE_OPEN_FAILED;
+			return ERROR_OUTPUT_FILE_OPEN_FAIL;
 		outFile.write((char*)FILE_SIGNATURE, sizeof(FILE_SIGNATURE));
 		std::vector<Codec*> codecList;
 		int error = write_codec_header(&outFile, &codecList, parameters);
@@ -1428,6 +1462,14 @@ namespace archiver {
 		//Sort files to try and put the ones with similar content closer to each other
 		if (parameters.useSolidBlock)
 			std::sort(entryList.begin(), entryList.end());
+		size_t totalContainedSize = 0;
+		for (auto it = entryList.begin(); it != entryList.end(); it++) {
+			it->globalPos = totalContainedSize;
+			if (it->type != 'f')
+				continue;
+			totalContainedSize += it->size;
+		}
+		callbacksInternal.init(parameters.threads, totalContainedSize);
 
 		error = write_file_tree_header(inputElements, &entryList, &outFile, &codecList, parameters);
 		if (error) {
@@ -1436,39 +1478,11 @@ namespace archiver {
 			std::filesystem::remove(archivePath);
 			return error;
 		}
-
-		if (parameters.deduplicationMemoryLog != 0) {
-			error = deduplicator(&entryList, parameters);
-			if (error) {
-				free_codec_list(&codecList);
-				outFile.close();
-				std::filesystem::remove(archivePath);
-				return error;
-			}
-			error = write_deduplication_header(&entryList, &outFile, &codecList, parameters);
-			if (error) {
-				free_codec_list(&codecList);
-				outFile.close();
-				std::filesystem::remove(archivePath);
-				return error;
-			}
-		}
-
-		//Amount of data to compress, for the progress bar
-		size_t totalContainedSize = 0;
-		size_t deduplicatedSize = 0;
-		for (auto it = entryList.begin(); it != entryList.end(); it++) {
-			if (it->type != 'f')
-				continue;
-			totalContainedSize += it->size;
-			for (size_t j = 0; j < it->dedupBlocks.size(); j++)
-				deduplicatedSize += it->dedupBlocks[j].length;
-		}
-		callbacksInternal.init(parameters.threads, totalContainedSize, deduplicatedSize);
-
+		
 		//Write end block
-		write_data_blocks(&outFile, &codecList, parameters, &entryList, &callbacksInternal);
-		PackedBlock endBlock = { nullptr, { 0 }, END_BLOCK_ID, 0 };
+		write_data_blocks(&outFile, &codecList, parameters, &entryList, totalContainedSize, &callbacksInternal);
+		PackedBlock endBlock;
+		endBlock.type = END_BLOCK_ID;
 		write_block(&outFile, &endBlock);
 
 		outFile.close();
@@ -1486,30 +1500,26 @@ namespace archiver {
 
 	struct UnpackedBlock {
 		uint8_t* data = nullptr;
-		std::vector<size_t> sizes;
-		size_t decodedSize = 0;
+		size_t rawSize;  //Bytes contained in this block
+		//Encoded size from each codec. First element is rawSize minus deduplicated chunks
+		std::vector<size_t> codecSizes;
 		int type = 0;
-		size_t index = 0;
 		size_t offset = 0;  //Position of contents of block from start of archive file
+		size_t globalPos = 0;  //Position of contents of block in terms of global file position
 		uint32_t dataChecksum;
+		std::vector<DedupChunk> dedupChunks;
 	};
-
-	struct {
-		bool operator()(const UnpackedBlock& a, const UnpackedBlock& b) const {
-			return a.index < b.index; 
-		}
-	} SortUnpackedBlockIndex;
 
 	void unpack_block(UnpackedBlock* unpackedBlock, std::vector<Codec*>* codecList, const Parameters& parameters, ThreadCallback* callbacks)
 	{
-		size_t storedSize = unpackedBlock->sizes.back();
+		size_t storedSize = unpackedBlock->codecSizes.back();
 
 		for (auto codec = codecList->rbegin(); codec != codecList->rend(); codec++) {
 
-			size_t encodedSize = unpackedBlock->sizes.back();
-			unpackedBlock->sizes.pop_back();
-			size_t decodedSize = unpackedBlock->sizes.back();
-			callbacks->set_progress_scale((double)unpackedBlock->sizes.front() / decodedSize);
+			size_t encodedSize = unpackedBlock->codecSizes.back();
+			unpackedBlock->codecSizes.pop_back();
+			size_t decodedSize = unpackedBlock->codecSizes.back();
+			callbacks->set_progress_scale((double)unpackedBlock->codecSizes.front() / std::max(decodedSize, (size_t)1));
 
 			uint8_t* output = new (std::nothrow) uint8_t[decodedSize];
 			if (!output) {
@@ -1528,35 +1538,33 @@ namespace archiver {
 			unpackedBlock->data = output;
 		}
 
-		callbacks->end_block(unpackedBlock->decodedSize, storedSize);
+		callbacks->end_block(unpackedBlock->codecSizes.back(), storedSize);
 	}
 
-	int read_block(std::fstream* inFile, UnpackedBlock* unpackedBlock, std::vector<Codec*>* codecList)
+	int read_block_header(std::fstream* inFile, UnpackedBlock* unpackedBlock, std::vector<Codec*>* codecList)
 	{
 		uint16_t storedHeaderChecksum = read_uint16le(inFile);
-		uint16_t headerSize = read_uint16le(inFile);
-		uint8_t* headerData = new uint8_t[headerSize + 2];
-		write_uint16le(headerData, headerSize);
-		inFile->read((char*)headerData + 2, headerSize);
-		const uint8_t* headerIt = headerData + 2;
+		size_t headerSize;
+		if (read_LEB128_file(inFile, &headerSize))
+			return ERROR_BAD_FILE;
+		uint8_t* headerData = new uint8_t[headerSize + 10];
+		uint8_t* headerSizeIt = headerData;
+		write_LEB128_ptr(headerSizeIt, headerSize);
+		const uint8_t* headerIt = headerSizeIt;
 		const uint8_t* headerEnd = headerIt + headerSize;
+		inFile->read((char*)headerIt, headerSize);
 
-		uint16_t computedHeaderChecksum = CRC::Calculate(headerData, headerSize + 2, CRC::CRC_16_X25());
+		uint16_t computedHeaderChecksum = CRC::Calculate(headerData, headerEnd - headerData, CRC::CRC_16_X25());
 		if (computedHeaderChecksum != storedHeaderChecksum) {
 			delete[] headerData;
 			return ERROR_BAD_CHECKSUM;
 		}
 
-		unpackedBlock->sizes.clear();
+		unpackedBlock->codecSizes.clear();
 		unpackedBlock->type = *headerIt++;
 		if (unpackedBlock->type == END_BLOCK_ID) {
 			delete[] headerData;
 			return NO_ERROR;
-		}
-
-		if (read_LEB128_ptr(headerIt, headerEnd, &unpackedBlock->index)) {
-			delete[] headerData;
-			return ERROR_BAD_FILE;
 		}
 
 		for (int i = 0; i <= codecList->size(); i++) {
@@ -1565,27 +1573,60 @@ namespace archiver {
 				delete[] headerData;
 				return ERROR_BAD_FILE;
 			}
-			unpackedBlock->sizes.push_back(size);
+			unpackedBlock->codecSizes.push_back(size);
 		}
+
+		//Dedup info
+		size_t dedupSize = 0;
+		if (unpackedBlock->type == DATA_BLOCK_ID) {
+
+			if (read_LEB128_ptr(headerIt, headerEnd, &unpackedBlock->globalPos)) {
+				delete[] headerData;
+				return ERROR_BAD_FILE;
+			}
+
+			size_t lastCopyEnd = 0;
+			while (true) {
+				DedupChunk newChunk;
+				newChunk.copied = false;
+				size_t length;
+				if (read_LEB128_ptr(headerIt, headerEnd, &length)) {
+					delete[] headerData;
+					return ERROR_BAD_FILE;
+				}
+				if (length == 0)
+					break;
+				newChunk.length = length;
+				dedupSize += newChunk.length;
+				size_t copyPosDelta;
+				if (read_LEB128_ptr(headerIt, headerEnd, &copyPosDelta)) {
+					delete[] headerData;
+					return ERROR_BAD_FILE;
+				}
+				newChunk.copyPos = copyPosDelta + lastCopyEnd;
+				lastCopyEnd = newChunk.copyPos + newChunk.length;
+				if (read_LEB128_ptr(headerIt, headerEnd, &newChunk.originalPos)) {
+					delete[] headerData;
+					return ERROR_BAD_FILE;
+				}
+				unpackedBlock->dedupChunks.push_back(newChunk);
+			}
+		}
+
+		unpackedBlock->rawSize = unpackedBlock->codecSizes.front() + dedupSize;
+
 		delete[] headerData;
-		unpackedBlock->decodedSize = unpackedBlock->sizes.front();
 		unpackedBlock->dataChecksum = read_uint32le(inFile);
 		unpackedBlock->offset = inFile->tellg();
 
 		return NO_ERROR;
 	}
 
-	int peek_block_type(std::fstream* inFile) {
-		inFile->seekg(4, std::fstream::cur);
-		int type = inFile->peek();
-		inFile->seekg(-4, std::fstream::cur);
-		return type;
-	}
-
 	int parse_file_tree_header(const uint8_t* headerStream, const size_t headerStreamSize,
 		std::vector<ArchiveEntry>* entryList, const std::string& outDir)
 	{
 		try {
+			size_t globalPos = 0;
 			const uint8_t* const headerStreamEnd = headerStream + headerStreamSize;
 
 			if (headerStream == headerStreamEnd)
@@ -1622,46 +1663,9 @@ namespace archiver {
 					size_t modifyTime;
 					if (read_LEB128_ptr(headerStream, headerStreamEnd, &modifyTime))
 						return ERROR_BAD_FILE;
-					entryList->push_back({ elementType, outDir + '/' + relPath, size, permissions, (time_t)modifyTime });
-				}
-			}
-		}
-		catch (std::bad_alloc& e) {
-			return ERROR_OUT_OF_MEMORY;
-		}
-		return NO_ERROR;
-	}
-
-	int parse_deduplication_header(const uint8_t* headerStream, const size_t headerStreamSize, std::vector<ArchiveEntry>* entryList)
-	{
-		try {
-			const uint8_t* const headerStreamEnd = headerStream + headerStreamSize;
-
-			if (headerStream == headerStreamEnd)
-				return ERROR_BAD_FILE;
-
-			while (true) {
-				size_t index;
-				if (read_LEB128_ptr(headerStream, headerStreamEnd, &index))
-					return ERROR_BAD_FILE;
-				if (index == 0)
-					break;
-				index--;
-
-				size_t numberDedupBlocks;
-				if (read_LEB128_ptr(headerStream, headerStreamEnd, &numberDedupBlocks))
-					return ERROR_BAD_FILE;
-
-				for (size_t j = 0; j < numberDedupBlocks; j++) {
-					size_t otherFileIndex, otherBlockOffset, offset, length;
-					if (read_LEB128_ptr(headerStream, headerStreamEnd, &otherFileIndex) ||
-						read_LEB128_ptr(headerStream, headerStreamEnd, &otherBlockOffset) ||
-						read_LEB128_ptr(headerStream, headerStreamEnd, &offset) ||
-						read_LEB128_ptr(headerStream, headerStreamEnd, &length))
-					{
-						return ERROR_BAD_FILE;
-					}
-					entryList->at(index).dedupBlocks.push_back({ otherFileIndex, otherBlockOffset, offset, length });
+					entryList->push_back({ elementType, outDir + '/' + relPath, size, permissions, (time_t)modifyTime, globalPos });
+					if (elementType == 'f')
+						globalPos += size;
 				}
 			}
 		}
@@ -1675,15 +1679,15 @@ namespace archiver {
 		std::vector<ArchiveEntry>* entryList, const std::string& outDir)
 	{
 		UnpackedBlock block;
-		int error = read_block(inFile, &block, codecList);
+		int error = read_block_header(inFile, &block, codecList);
 		if (error)
 			return error;
 		if (block.type != FILE_TREE_BLOCK_ID)
 			return ERROR_BAD_FILE;
-		block.data = new (std::nothrow) uint8_t[block.sizes.back()];
+		block.data = new (std::nothrow) uint8_t[block.codecSizes.back()];
 		if (!block.data)
 			return ERROR_OUT_OF_MEMORY;
-		inFile->read((char*)block.data, block.sizes.back());
+		inFile->read((char*)block.data, block.codecSizes.back());
 
 		ThreadCallback threadCallback;
 		threadCallback.init(0, nullptr);
@@ -1691,33 +1695,7 @@ namespace archiver {
 		if (threadCallback.get_error())
 			return threadCallback.get_error();
 
-		error = parse_file_tree_header(block.data, block.decodedSize, entryList, outDir);
-		delete[] block.data;
-		return error;
-	}
-
-	int try_read_deduplication_header(std::fstream* inFile, std::vector<Codec*>* codecList, const Parameters& parameters, std::vector<ArchiveEntry>* entryList)
-	{
-		int blockType = peek_block_type(inFile);
-		if (blockType != DEDUPLICATION_BLOCK_ID)
-			return NO_ERROR;
-
-		UnpackedBlock block;
-		int error = read_block(inFile, &block, codecList);
-		if (error)
-			return error;
-		block.data = new (std::nothrow) uint8_t[block.sizes.back()];
-		if (!block.data)
-			return ERROR_OUT_OF_MEMORY;
-		inFile->read((char*)block.data, block.sizes.back());
-
-		ThreadCallback threadCallback;
-		threadCallback.init(0, nullptr);
-		unpack_block(&block, codecList, parameters, &threadCallback);
-		if (threadCallback.get_error())
-			return threadCallback.get_error();
-
-		error = parse_deduplication_header(block.data, block.decodedSize, entryList);
+		error = parse_file_tree_header(block.data, block.rawSize, entryList, outDir);
 		delete[] block.data;
 		return error;
 	}
@@ -1780,7 +1758,7 @@ namespace archiver {
 	}
 
 	std::filesystem::file_time_type convert_to_filesystem_time(time_t time) {
-#if __cplusplus >= 202002L
+#if CPP_VER >= 202002L
 		auto systemClock = std::chrono::system_clock::from_time_t(time);
 		auto fileClock = std::chrono::clock_cast<std::chrono::file_clock>(systemClock);
 		return fileClock;
@@ -1798,21 +1776,19 @@ namespace archiver {
 				continue;
 			std::filesystem::create_directories(it->absolutePath, e);
 			if (e)
-				return ERROR_OTHER;
+				return ERROR_OUTPUT_FILE_OPEN_FAIL;
 		}
-		//File creation
 		for (auto it = entryList.begin(); it != entryList.end(); it++) {
 			if (it->type != 'f')
 				continue;
 			std::fstream o(it->absolutePath, std::fstream::out | std::fstream::binary);
 			if (!o.is_open())
-				return ERROR_OTHER;
+				return ERROR_OUTPUT_FILE_OPEN_FAIL;
 		}
 		return NO_ERROR;
 	}
 
 	void apply_attributes(const std::vector<ArchiveEntry>& entryList) {
-		//Directory
 		std::error_code e;
 		for (auto it = entryList.begin(); it != entryList.end(); it++) {
 			if (it->type == 'd' || it->type == 'f') {
@@ -1833,179 +1809,263 @@ namespace archiver {
 		}
 	}
 
-	int detect_data_blocks(std::vector<UnpackedBlock>* dataBlocks, std::fstream* inFile, std::vector<Codec*>* codecList) {
+	//Undeduplicates any chunk whose reference is inside the same block, 
+	// and places not deduplicated data in its real position. This means some chunks remain not decoded.
+	void partial_undeduplication(UnpackedBlock* dataBlock, ThreadCallback* progress) {
 
-		while (true) {
-			UnpackedBlock newBlock;
-			int error = read_block(inFile, &newBlock, codecList);
-			if (error) 
-				return error;
-			if (newBlock.type == END_BLOCK_ID)
-				break;
-			if (newBlock.type != DATA_BLOCK_ID) 
-				return ERROR_BAD_FILE;
-			inFile->seekg(newBlock.sizes.back(), std::fstream::cur);
-			dataBlocks->push_back(newBlock);
+		if (dataBlock->dedupChunks.size() == 0)
+			return;
+
+		uint8_t* tmp = new (std::nothrow) uint8_t[dataBlock->rawSize];
+		if (!tmp) {
+			progress->set_error(ERROR_OUT_OF_MEMORY);
+			return;
 		}
-		std::sort(dataBlocks->begin(), dataBlocks->end(), SortUnpackedBlockIndex);
-		return NO_ERROR;
+		size_t dataPos = 0;
+		size_t tmpPos = 0;
+
+		for (int i = 0; i < dataBlock->dedupChunks.size(); i++) {
+			memcpy(tmp + tmpPos, dataBlock->data + dataPos, dataBlock->dedupChunks[i].copyPos - tmpPos);
+			dataPos += dataBlock->dedupChunks[i].copyPos - tmpPos;
+			tmpPos += dataBlock->dedupChunks[i].copyPos - tmpPos;
+			if (dataBlock->dedupChunks[i].originalPos >= dataBlock->globalPos &&
+				dataBlock->dedupChunks[i].originalPos < dataBlock->globalPos + tmpPos)
+			{
+				memcpy(tmp + tmpPos, tmp + dataBlock->dedupChunks[i].originalPos - dataBlock->globalPos, dataBlock->dedupChunks[i].length);
+				dataBlock->dedupChunks[i].copied = true;
+				progress->add_base_progress(dataBlock->dedupChunks[i].length);
+			}
+			tmpPos += dataBlock->dedupChunks[i].length;
+		}
+
+		memcpy(tmp + tmpPos, dataBlock->data + dataPos, dataBlock->codecSizes.front() - dataPos);
+		delete[] dataBlock->data;
+		dataBlock->data = tmp;
 	}
 
-	int extract_data_blocks(std::fstream* inFile, std::vector<Codec*>* codecList, const Parameters& parameters,
-		std::vector<ArchiveEntry>* entryList, size_t dataToDecompress, ArchiveCallbackInternal* callbacksInternal)
+	void extract_data_thread(std::fstream* inFile, std::vector<Codec*>* codecList, const Parameters& parameters,
+		std::vector<ArchiveEntry>* entryList, std::vector<UnpackedBlock*>* dataBlocks, 
+		std::mutex* readMtx, ThreadCallback* progress)
 	{
-		std::vector<UnpackedBlock> dataBlocks;
-		int error = detect_data_blocks(&dataBlocks, inFile, codecList);
-		if (error)
-			return error;
+		while (true) {
 
-		std::fstream outFile;
-		size_t writtenFiles = 0;
+			readMtx->lock();
 
-		std::thread* cpu = new std::thread[parameters.threads];
-		ThreadCallback* progress = new ThreadCallback[parameters.threads];
-		for (int i = 0; i < parameters.threads; i++)
-			progress[i].init(i, callbacksInternal);
-
-		//Create threads using a circular buffer
-		size_t startedThreads = 0;
-		size_t consumedThreads = 0;
-
-		while (dataToDecompress || consumedThreads != startedThreads) {
-
-			while (startedThreads < consumedThreads + parameters.threads && dataToDecompress && !callbacksInternal->abort()) {
-
-				dataBlocks[startedThreads].data = new (std::nothrow) uint8_t[dataBlocks[startedThreads].sizes.back()];
-				if (!dataBlocks[startedThreads].data) {
-					callbacksInternal->set_error(ERROR_OUT_OF_MEMORY);
-					goto outputError;
-				}
-				if (dataBlocks[startedThreads].decodedSize > dataToDecompress ||
-					dataBlocks[startedThreads].type != DATA_BLOCK_ID)
-				{
-					callbacksInternal->set_error(ERROR_BAD_FILE);
-					goto outputError;
-				}
-				inFile->seekg(dataBlocks[startedThreads].offset);
-				inFile->read((char*)dataBlocks[startedThreads].data, dataBlocks[startedThreads].sizes.back());
-				uint32_t computedDataChecksum = CRC::Calculate(dataBlocks[startedThreads].data, dataBlocks[startedThreads].sizes.back(), CRC::CRC_32());
-				if (computedDataChecksum != dataBlocks[startedThreads].dataChecksum) {
-					delete[] dataBlocks[startedThreads].data;
-					callbacksInternal->set_error(ERROR_BAD_CHECKSUM);
-					goto outputError;
-				}
-				dataToDecompress -= dataBlocks[startedThreads].decodedSize;
-
-				size_t thisThreadID = startedThreads % parameters.threads;
-				cpu[thisThreadID] = std::thread(unpack_block, &dataBlocks[startedThreads], codecList, parameters, &progress[thisThreadID]);
-				startedThreads++;
+			//End block found by another thread
+			if (dataBlocks->size() > 0 && dataBlocks->back()->type == END_BLOCK_ID) {
+				readMtx->unlock();
+				return;
 			}
 
-			size_t thisThreadID = consumedThreads % parameters.threads;
-			cpu[thisThreadID].join();
+			UnpackedBlock* dataBlock = new UnpackedBlock();
+			dataBlocks->push_back(dataBlock);
+			int error = read_block_header(inFile, dataBlock, codecList);
+			if (error) {
+				readMtx->unlock();
+				progress->set_error(error);
+				return;
+			}
+			if (dataBlock->type == END_BLOCK_ID) {
+				readMtx->unlock();
+				return;
+			}
+			if (dataBlock->type != DATA_BLOCK_ID) {
+				readMtx->unlock();
+				progress->set_error(ERROR_BAD_FILE);
+				return;
+			}
 
-			//Error during block decoding
-			if (callbacksInternal->abort())
-				break;
+			dataBlock->data = new (std::nothrow) uint8_t[dataBlock->codecSizes.back()];
+			if (!dataBlock->data) {
+				readMtx->unlock();
+				progress->set_error(ERROR_OUT_OF_MEMORY);
+				return;
+			}
+			inFile->read((char*)dataBlock->data, dataBlock->codecSizes.back());
 
-			size_t bytesWritten = 0;
-			while (dataBlocks[consumedThreads].decodedSize) {
+			readMtx->unlock();
+
+			uint32_t computedDataChecksum = CRC::Calculate(dataBlock->data, dataBlock->codecSizes.back(), CRC::CRC_32());
+			if (computedDataChecksum != dataBlock->dataChecksum) {
+				delete[] dataBlock->data;
+				progress->set_error(ERROR_BAD_CHECKSUM);
+				return;
+			}
+
+			unpack_block(dataBlock, codecList, parameters, progress);
+			//Error during block decoding or operation was canceled
+			if (progress->abort()) 
+				return;
+
+			partial_undeduplication(dataBlock, progress);
+			if (progress->abort())
+				return;
+
+			size_t fileIndex, fileOffset;
+			find_file_and_offset_from_global_pos(entryList, dataBlock->globalPos, &fileIndex, &fileOffset);
+			std::fstream outFile;
+			size_t blockPos = 0;
+
+			while (blockPos < dataBlock->rawSize) {
 
 				if (!outFile.is_open()) {
-					if (entryList->at(writtenFiles).type != 'f') {
-						writtenFiles++;
+					if (entryList->at(fileIndex).type != 'f' || entryList->at(fileIndex).size == 0) {
+						fileIndex++;
 						continue;
 					}
-					outFile.open(entryList->at(writtenFiles).absolutePath, std::fstream::binary | std::fstream::out);
+					outFile.open(entryList->at(fileIndex).absolutePath, std::fstream::binary | std::fstream::in | std::fstream::out);
 					if (!outFile.is_open()) {
-						callbacksInternal->set_error(ERROR_FILE_OPEN_FAILED);
-						goto outputError;
+						progress->set_error(ERROR_OUTPUT_FILE_OPEN_FAIL);
+						delete[] dataBlock->data;
+						return;
 					}
+					if (fileOffset != 0)
+						outFile.seekp(fileOffset);
 				}
 
-				size_t nextFileCut = entryList->at(writtenFiles).get_next_file_cut();
-				size_t bytesToWrite = std::min(nextFileCut - outFile.tellp(), dataBlocks[consumedThreads].decodedSize);
-				outFile.write((char*)dataBlocks[consumedThreads].data + bytesWritten, bytesToWrite);
-				dataBlocks[consumedThreads].decodedSize -= bytesToWrite;
-				bytesWritten += bytesToWrite;
+				size_t bytesToWrite = std::min(entryList->at(fileIndex).size - outFile.tellp(), dataBlock->rawSize - blockPos);
+				outFile.write((char*)dataBlock->data + blockPos, bytesToWrite);
+				blockPos += bytesToWrite;
 
-				if (outFile.tellp() == nextFileCut && outFile.tellp() != entryList->at(writtenFiles).size) {
-					outFile.seekp(entryList->at(writtenFiles).dedupBlocks[entryList->at(writtenFiles).nextDedupBlock].length, std::fstream::cur);
-					entryList->at(writtenFiles).nextDedupBlock++;
-				}
-
-				if (entryList->at(writtenFiles).size == outFile.tellp()) {
+				if (entryList->at(fileIndex).size == outFile.tellp()) {
 					outFile.close();
-					writtenFiles++;
+					fileIndex++;
+					fileOffset = 0;
 				}
 			}
-			delete[] dataBlocks[consumedThreads].data;
-			consumedThreads++;
-		}
 
-	outputError:
-
-		//There might be leftovers due to an error or abort
-		for (; consumedThreads < startedThreads; consumedThreads++) {
-			if (cpu[consumedThreads % parameters.threads].joinable())
-				cpu[consumedThreads % parameters.threads].join();
+			if (outFile.is_open()) 
+				outFile.close();
+			delete[] dataBlock->data;
 		}
-		delete[] cpu;
-		delete[] progress;
-		return callbacksInternal->get_error();
 	}
 
-	int undeduplicate(std::vector<ArchiveEntry>* entryList) {
+	void undeduplicate_thread(std::vector<ArchiveEntry>* entryList, std::vector<UnpackedBlock*>* dataBlocks, 
+		size_t* blockIt, size_t* chunkIt, std::mutex* mtx, ThreadCallback* progress) {
 
 		const size_t COPY_LENGTH = 65536;
 		uint8_t* data = new (std::nothrow) uint8_t[COPY_LENGTH];
-		if (!data)
-			return ERROR_OUT_OF_MEMORY;
+		if (!data) {
+			progress->set_error(ERROR_OUT_OF_MEMORY);
+			return;
+		}
 
-		for (auto fileIt = entryList->begin(); fileIt != entryList->end(); fileIt++) {
+		size_t lastOpenedCopyFile = -1;
+		std::fstream copyFile;
+		size_t lastOpenedOriginalFile = -1;
+		std::fstream originalFile;
 
-			if (fileIt->dedupBlocks.size() == 0)
+		while (true) {
+
+			mtx->lock();
+
+			if (*blockIt >= dataBlocks->size()) {
+				mtx->unlock();
+				delete[] data;
+				return;
+			}
+
+			if (*chunkIt == dataBlocks->at(*blockIt)->dedupChunks.size()) {
+				(*blockIt)++;
+				*chunkIt = 0;
+				mtx->unlock();
 				continue;
-			std::fstream overwrite(fileIt->absolutePath, std::fstream::binary | std::fstream::in | std::fstream::out);
+			}
 
-			for (auto blockIt = fileIt->dedupBlocks.begin(); blockIt != fileIt->dedupBlocks.end(); blockIt++) {
+			size_t thisBlock = *blockIt;
+			size_t thisChunk = *chunkIt;
+			(*chunkIt)++;
 
-				if (blockIt->originalFile >= entryList->size() ||
-					blockIt->originalOffset >= entryList->at(blockIt->originalFile).size ||
-					blockIt->copyOffset >= fileIt->size)
-				{
-					return ERROR_BAD_FILE;
-				}
+			mtx->unlock();
 
-				size_t remaining = blockIt->length;
-				if (entryList->begin() + blockIt->originalFile == fileIt) {
-					size_t pos = 0;
-					while (remaining) {
-						size_t copy = std::min(remaining, COPY_LENGTH);
-						overwrite.seekg(blockIt->originalOffset + pos);
-						overwrite.read((char*)data, copy);
-						overwrite.seekp(blockIt->copyOffset + pos);
-						overwrite.write((char*)data, copy);
-						remaining -= copy;
-						pos += copy;
-					}
-				}
-				else {
-					std::fstream dup(entryList->at(blockIt->originalFile).absolutePath, std::fstream::binary | std::fstream::in);
-					dup.seekg(blockIt->originalOffset);
-					overwrite.seekp(blockIt->copyOffset);
-					while (remaining) {
-						size_t copy = std::min(remaining, COPY_LENGTH);
-						dup.read((char*)data, copy);
-						overwrite.write((char*)data, copy);
-						remaining -= copy;
-					}
+			if (dataBlocks->at(thisBlock)->dedupChunks[thisChunk].copied)
+				continue;
+
+			size_t copyFileIndex, copyFileOffset;
+			find_file_and_offset_from_global_pos(entryList,
+				dataBlocks->at(thisBlock)->dedupChunks[thisChunk].copyPos + dataBlocks->at(thisBlock)->globalPos, &copyFileIndex, &copyFileOffset);
+			size_t originalFileIndex, originalFileOffset;
+			find_file_and_offset_from_global_pos(entryList,
+				dataBlocks->at(thisBlock)->dedupChunks[thisChunk].originalPos, &originalFileIndex, &originalFileOffset);
+
+			if (originalFileIndex >= entryList->size() || copyFileIndex >= entryList->size() ||
+				originalFileOffset >= entryList->at(originalFileIndex).size ||
+				copyFileOffset >= entryList->at(copyFileIndex).size)
+			{
+				delete[] data;
+				progress->set_error(ERROR_BAD_FILE);
+				return;
+			}
+
+			if (lastOpenedCopyFile != copyFileIndex) {
+				copyFile.close();
+				copyFile.open(entryList->at(copyFileIndex).absolutePath, std::fstream::binary | std::fstream::in | std::fstream::out);
+				lastOpenedCopyFile = copyFileIndex;
+			}
+
+			size_t remaining = dataBlocks->at(thisBlock)->dedupChunks[thisChunk].length;
+			if (originalFileIndex == copyFileIndex) {
+				size_t pos = 0;
+				while (remaining) {
+					size_t bytes = std::min(remaining, COPY_LENGTH);
+					copyFile.seekg(originalFileOffset + pos);
+					copyFile.read((char*)data, bytes);
+					copyFile.seekp(copyFileOffset + pos);
+					copyFile.write((char*)data, bytes);
+					remaining -= bytes;
+					pos += bytes;
 				}
 			}
+			else {
+
+				if (lastOpenedOriginalFile != originalFileIndex) {
+					originalFile.close();
+					originalFile.open(entryList->at(originalFileIndex).absolutePath, std::fstream::binary | std::fstream::in | std::fstream::out);
+					lastOpenedOriginalFile = originalFileIndex;
+				}
+
+				originalFile.seekg(originalFileOffset);
+				copyFile.seekp(copyFileOffset);
+				while (remaining) {
+					size_t bytes = std::min(remaining, COPY_LENGTH);
+					originalFile.read((char*)data, bytes);
+					copyFile.write((char*)data, bytes);
+					remaining -= bytes;
+				}
+			}
+
+			progress->add_base_progress(dataBlocks->at(thisBlock)->dedupChunks[thisChunk].length);
 		}
 
 		delete[] data;
-		return NO_ERROR;
+	}
+
+	void extract_data_blocks(std::fstream* inFile, std::vector<Codec*>* codecList, const Parameters& parameters,
+		std::vector<ArchiveEntry>* entryList, std::vector<UnpackedBlock*>* dataBlocks, ArchiveCallbackInternal* callbacksInternal)
+	{
+		std::mutex readMtx;
+		std::thread* cpu = new std::thread[parameters.threads];
+		ThreadCallback* threadCallbacks = new ThreadCallback[parameters.threads];
+
+		for (int i = 0; i < parameters.threads; i++) {
+			threadCallbacks[i].init(i, callbacksInternal);
+			cpu[i] = std::thread(extract_data_thread, inFile, codecList, parameters, entryList, dataBlocks, &readMtx, &threadCallbacks[i]);
+		}
+		for (int i = 0; i < parameters.threads; i++)
+			cpu[i].join();
+
+		//Undo deduplication
+		if (!callbacksInternal->abort()) {
+			size_t blockIt = 0;
+			size_t chunkIt = 0;
+			for (int i = 0; i < parameters.threads; i++)
+				cpu[i] = std::thread(undeduplicate_thread, entryList, dataBlocks, &blockIt, &chunkIt, &readMtx, &threadCallbacks[i]);
+			for (int i = 0; i < parameters.threads; i++)
+				cpu[i].join();
+		}
+
+		delete[] cpu;
+		delete[] threadCallbacks;
 	}
 
 	int extract_archive(const std::string& file, const std::string& outDir, const Parameters& parameters, ArchiveCallback* callbacks)
@@ -2014,7 +2074,7 @@ namespace archiver {
 
 		std::fstream inFile(file, std::fstream::binary | std::fstream::in);
 		if (!inFile.is_open())
-			return ERROR_FILE_OPEN_FAILED;
+			return ERROR_INPUT_FILE_OPEN_FAIL;
 		uint8_t storedSignature[sizeof(FILE_SIGNATURE)];
 		inFile.read((char*)storedSignature, sizeof(FILE_SIGNATURE));
 		if (!std::equal(storedSignature, storedSignature + sizeof(FILE_SIGNATURE), FILE_SIGNATURE))
@@ -2034,11 +2094,6 @@ namespace archiver {
 			free_codec_list(&codecList);
 			return error;
 		}
-		error = try_read_deduplication_header(&inFile, &codecList, parameters, &entryList);
-		if (error) {
-			free_codec_list(&codecList);
-			return error;
-		}
 
 		error = generate_directory_structure(entryList);
 		if (error) {
@@ -2049,36 +2104,23 @@ namespace archiver {
 
 		//Amount of data to decompress, for the progress bar
 		size_t totalContainedSize = 0;
-		size_t deduplicatedSize = 0;
 		for (auto it = entryList.begin(); it != entryList.end(); it++) {
 			if (it->type != 'f')
 				continue;
 			totalContainedSize += it->size;
-			for (size_t i = 0; i < it->dedupBlocks.size(); i++)
-				deduplicatedSize += it->dedupBlocks[i].length;
 		}
-		callbacksInternal.init(parameters.threads, totalContainedSize, deduplicatedSize);
-		size_t dataToDecompress = totalContainedSize - deduplicatedSize;
-		error = extract_data_blocks(&inFile, &codecList, parameters, &entryList, dataToDecompress, &callbacksInternal);
-		if (error) {
-			free_codec_list(&codecList);
-			clean_directory_structure(entryList);
-			return error;
-		}
+		callbacksInternal.init(parameters.threads, totalContainedSize);
 
-		//Undo data deduplication
-		if (!callbacksInternal.abort()) {
-			error = undeduplicate(&entryList);
-			if (error) {
-				free_codec_list(&codecList);
-				clean_directory_structure(entryList);
-				return error;
-			}
-		}
+		std::vector<UnpackedBlock*> dataBlocks;
+		extract_data_blocks(&inFile, &codecList, parameters, &entryList, &dataBlocks, &callbacksInternal);
+
+		for (size_t i = 0; i < dataBlocks.size(); i++)
+			delete dataBlocks[i];
 
 		if (callbacksInternal.abort())
 			clean_directory_structure(entryList);
-		apply_attributes(entryList);
+		else
+			apply_attributes(entryList);
 		free_codec_list(&codecList);
 		return callbacksInternal.get_error();
 	}
@@ -2103,14 +2145,14 @@ namespace archiver {
 			outBufferSize = codec->encode_bound(outBufferSize);
 		}
 
-		size_t deduplicatorMemoryUsage = (size_t)64 * sizeof(FileBlock) << parameters.deduplicationMemoryLog;
-		return std::max((parameters.maxBlockSize + outBufferSize + maxCodecMemoryUsage) * parameters.threads, deduplicatorMemoryUsage);
+		size_t deduplicatorMemoryUsage = (size_t)64 * sizeof(DeduperDictEntry) << parameters.deduplicationMemoryLog;
+		return (parameters.maxBlockSize + outBufferSize + maxCodecMemoryUsage) * parameters.threads + deduplicatorMemoryUsage;
 	}
 	int is_archive_encrypted(const std::string& file) {
 
 		std::fstream inFile(file, std::fstream::binary | std::fstream::in);
 		if (!inFile.is_open())
-			return ERROR_FILE_OPEN_FAILED;
+			return ERROR_INPUT_FILE_OPEN_FAIL;
 
 		uint8_t storedSignature[sizeof(FILE_SIGNATURE)];
 		inFile.read((char*)storedSignature, sizeof(FILE_SIGNATURE));
